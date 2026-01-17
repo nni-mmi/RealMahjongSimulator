@@ -1,0 +1,417 @@
+import random
+
+# ===============================
+# デバッグ出力ラッパー
+# ===============================
+class Logger:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+
+    def log(self, *args, **kwargs):
+        if self.enabled:
+            formatted_args = []
+            for arg in args:
+                if isinstance(arg, list):
+                    formatted_args.append(", ".join(str(a) for a in arg))
+                elif isinstance(arg, dict):
+                    formatted_args.append(", ".join(f"{k}:{v}" for k, v in arg.items()))
+                else:
+                    formatted_args.append(str(arg))
+            print(*formatted_args, **kwargs)
+
+logger = Logger(enabled=True)
+
+# ===============================
+# 麻雀卓の座標定義
+# ===============================
+sides = {"A": (1,0), "B": (0,-1), "C": (-1,0), "D": (0,1)}
+
+# 画面座標系に合わせた時計回り・反時計回り
+clockwise_order = ["A", "D", "C", "B"]
+counter_clockwise_order = ["A", "B", "C", "D"]
+
+def next_clockwise(side):
+    idx = clockwise_order.index(side)
+    return clockwise_order[(idx + 1) % 4]
+
+def next_counter_clockwise(side):
+    idx = counter_clockwise_order.index(side)
+    return counter_clockwise_order[(idx + 1) % 4]
+
+# ===============================
+# プレイヤークラス
+# ===============================
+kana_chars = list("アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポ")
+
+class Player:
+    def __init__(self, name, type_="CPU"):
+        self.name = name
+        self.type = type_
+        self.initial_wind = None  # 仮で引いた風牌
+        self.seat = None          # A/B/C/D
+        self.wind = None          # 東南西北（最終的な家）
+        self.is_kariton = False
+        self.is_parent = False
+        self.wall = None          # Wallオブジェクト
+
+    def __repr__(self):
+        return f"{self.name}({self.type}, seat={self.seat}, wind={self.wind})"
+
+def generate_player_name():
+    return "".join(random.choices(kana_chars, k=2))
+
+def create_players():
+    players = [Player(generate_player_name()) for _ in range(3)]
+    players.append(Player("あなた", type_="Human"))
+    random.shuffle(players)
+    return players
+
+# ===============================
+# 仮東（kariton）決定処理
+# ===============================
+wind_tiles = ["東", "南", "西", "北"]
+
+def decide_kariton(players):
+    mixer = random.choice(players)
+
+    drawn_winds = random.sample(wind_tiles, 4)
+    for player, wind in zip(players, drawn_winds):
+        player.initial_wind = wind
+
+    east_player = next(p for p in players if p.initial_wind == "東")
+    east_side = random.choice(["A", "B", "C", "D"])
+    east_player.seat = east_side
+    east_player.is_kariton = True
+    kariton_order = {east_side: east_player}
+
+    # 仮東を起点に反時計回りで南・西・北を配置
+    current_side = east_side
+    for wind in ["南", "西", "北"]:
+        current_side = next_counter_clockwise(current_side)
+        player = next(p for p in players if p.initial_wind == wind)
+        player.seat = current_side
+        kariton_order[current_side] = player
+
+    return kariton_order, mixer
+
+# ===============================
+# サイコロ判定処理
+# ===============================
+def roll_dice():
+    return random.randint(1,6), random.randint(1,6)
+
+def get_target_player_by_total(roller_side, total):
+    """サイコロ合計値から対象プレイヤーの辺を返す"""
+    move_table = {
+        (5,9): 0,
+        (2,6,10): 1,
+        (3,7,11): 2,
+        (4,8,12): 3
+    }
+
+    steps = None
+    for nums, step in move_table.items():
+        if total in nums:
+            steps = step
+            break
+
+    # 反時計回りの順に従って対象者を決定
+    idx = counter_clockwise_order.index(roller_side)
+    target_side = counter_clockwise_order[(idx + steps) % 4]
+    return target_side
+
+def roll_and_get_target(roller_name, roller_side):
+    """サイコロを1回振り、対象の辺と合計値とダイスそれぞれの値を返す（純粋な手続きの共通化）"""
+    die1, die2 = roll_dice()
+    total = die1 + die2
+    target_side = get_target_player_by_total(roller_side, total)
+    return target_side, total, die1, die2
+
+# ===============================
+# 仮親決定処理
+# ===============================
+def decide_temp_parent(kariton_order):
+    """手順1: 仮東がサイコロを振って仮親を決定
+       - 仮東がサイコロを振り、仮親を決める
+       - サイコロの合計値で仮親を決定し、そのプレイヤーの辺を決める
+    """
+    east_side = next(side for side, p in kariton_order.items() if p.initial_wind == "東")
+    target_side, total, die1, die2 = roll_and_get_target(east_side, east_side)  # サイドだけ渡す
+    return east_side, target_side, total, die1, die2 
+
+# ===============================
+# 親決定処理
+# ===============================
+def decide_real_parent(kariton_order, temp_parent_side):
+    """手順2: 仮親がサイコロを振って本当の親を決定"""
+    temp_parent = kariton_order[temp_parent_side]
+    target_side, total, die1, die2 = roll_and_get_target(temp_parent.seat, temp_parent.seat)
+    real_parent = kariton_order[target_side]
+    real_parent.is_parent = True
+    return target_side, real_parent, total, die1, die2 
+
+# ===============================
+# 親決定後の座席割り更新
+# ===============================
+def assign_seats_after_parent_decided(kariton_order, real_parent_side):
+    """親決定後に座席割りを更新"""
+    real_parent = kariton_order[real_parent_side]
+    real_parent.wind = "東"  # 親を東家に変更
+
+    # 反時計回りで残りの風を割り当てる
+    remaining_winds = ["南", "西", "北"]
+    sides_order = counter_clockwise_order
+    idx = sides_order.index(real_parent_side)
+    for wind in remaining_winds:
+        idx = (idx + 1) % 4
+        side = sides_order[idx]
+        player = kariton_order[side]
+        player.wind = wind
+
+    return kariton_order
+
+# ===============================
+# 使用麻雀牌の定義（基本的に変更禁止：方針や前提がブレる為）
+# ===============================
+tiles = "🀇,🀇,🀇,🀇,🀈,🀈,🀈,🀈,🀉,🀉,🀉,🀉,🀊,🀊,🀊,🀊,🀢赤5m,🀋,🀋,🀋,🀌,🀌,🀌,🀌,🀍,🀍,🀍,🀍,🀎,🀎,🀎,🀎,🀏,🀏,🀏,🀏,🀙,🀙,🀙,🀙,🀚,🀚,🀚,🀚,🀛,🀛,🀛,🀛,🀜,🀜,🀜,🀜,🀣赤5p,🀝,🀝,🀝,🀞,🀞,🀞,🀞,🀟,🀟,🀟,🀟,🀠,🀠,🀠,🀠,🀡,🀡,🀡,🀡,🀐,🀐,🀐,🀐,🀑,🀑,🀑,🀑,🀒,🀒,🀒,🀒,🀓,🀓,🀓,🀓,🀤赤5s,🀔,🀔,🀔,🀕,🀕,🀕,🀕,🀖,🀖,🀖,🀖,🀗,🀗,🀗,🀗,🀘,🀘,🀘,🀘,🀀,🀀,🀀,🀀,🀁,🀁,🀁,🀁,🀂,🀂,🀂,🀂,🀃,🀃,🀃,🀃,🀆,🀆,🀆,🀆,🀅,🀅,🀅,🀅,🀄,🀄,🀄,🀄"
+
+meaning = {
+    "🀇": "1m", "🀈": "2m", "🀉": "3m", "🀊": "4m",
+    "🀋": "5m", "🀌": "6m", "🀍": "7m", "🀎": "8m", "🀏": "9m",
+    "🀢赤5m": "5mRed",
+
+    "🀙": "1p", "🀚": "2p", "🀛": "3p", "🀜": "4p",
+    "🀝": "5p", "🀞": "6p", "🀟": "7p", "🀠": "8p", "🀡": "9p",
+    "🀣赤5p": "5pRed",
+
+    "🀐": "1s", "🀑": "2s", "🀒": "3s", "🀓": "4s",
+    "🀔": "5s", "🀕": "6s", "🀖": "7s", "🀗": "8s", "🀘": "9s",
+    "🀤赤5s": "5sRed",
+
+    "🀀": "ton", "🀁": "nan", "🀂": "sha", "🀃": "pei",
+    "🀆": "haku", "🀅": "hatsu", "🀄": "chun"
+}
+
+# ===============================
+# 牌を混ぜて壁牌を作る
+# ===============================
+class Wall:
+    def __init__(self):
+        self.columns = []  # [[上,下], ...]
+
+    def add_column(self, upper, lower):
+        self.columns.append([upper, lower])
+
+    def upper_row(self):
+        return [col[0] for col in self.columns]
+
+    def lower_row(self):
+        return [col[1] for col in self.columns]
+
+def shuffle_tiles():
+    """牌を混ぜてリストで返す"""
+    tile_list = [t.strip() for t in tiles.split(",")]
+    random.shuffle(tile_list)
+    return tile_list
+
+def build_walls(tile_list, kariton_order):
+    """プレイヤーごとの壁牌（17列×2行）を作成"""
+    for side, player in kariton_order.items():
+        wall = Wall()
+        for _ in range(17):
+            upper = tile_list.pop(0)
+            lower = tile_list.pop(0)
+            wall.add_column(upper, lower)
+        player.wall = wall
+
+    return {side: player.wall for side, player in kariton_order.items()}
+
+# ===============================
+# 開門＝切り山の位置決定
+# ===============================
+def kaimen(parent: Player, kariton_order: dict):
+    """
+    親がサイコロを振って開門位置を決める
+    1. サイコロ出目で対象者（辺）を決定
+    2. その人の壁牌の右から出目列目で分離
+    """
+    parent_side = parent.seat
+
+    target_side, total, die1, die2 = roll_and_get_target(parent.name, parent_side)
+    target_player = kariton_order[target_side]
+
+    wall = target_player.wall
+    split_index = max(0, len(wall.columns)-total)
+    left_columns = wall.columns[:split_index]
+    right_columns = wall.columns[split_index:]
+
+    return target_player, left_columns, right_columns, total, die1, die2
+
+# ===============================
+# 表示の調整　UI／プレゼンテーション層
+# ===============================
+# ログを修飾する
+def log_title(title):
+    logger.log(f"\n─── {title} ───")
+
+# 風の並び番
+wind_order = ["東", "南", "西", "北"]
+
+# 「引いた風牌」を風の並び順にソート表示
+def show_drawn_winds(players):
+    log_title("各々が引いた風牌")
+    sorted_players = sorted(players, key=lambda p: wind_order.index(p.initial_wind))
+    logger.log(", ".join(f"{p.name}:{p.initial_wind}" for p in sorted_players))
+
+# 席表示・場風表示を風の並び順にソート表示
+def show_seating_by_wind(kariton_order):
+    sorted_items = sorted(
+        kariton_order.items(),
+        key=lambda item: wind_order.index(item[1].wind)
+    )
+    for side, player in sorted_items:
+        logger.log(f"{side} {player.name} ({player.wind})")
+
+# 席表示・場風表示を初期風の並び順にソート表示
+def show_seating_by_initial_wind(kariton_order):
+    sorted_items = sorted(
+        kariton_order.items(),
+        key=lambda item: wind_order.index(item[1].initial_wind)
+    )
+    for side, player in sorted_items:
+        logger.log(f"{side} {player.name} ({player.initial_wind})")
+
+# サイコロ演出
+def show_dice(roller_name, die1, die2):
+    logger.log(f"─── {roller_name} がサイコロを振りました……")
+    logger.log(f"               {die1}、{die2} ＝ 出目合計 {die1 + die2} ───")
+
+# 洗牌という語とshuffle_tiles()を対応させるラッパー
+def shipai():
+    log_title("洗牌")
+    shipai_tiles = shuffle_tiles()
+    logger.log(", ".join(shipai_tiles))
+    return shipai_tiles
+
+# 砌牌という語とbuild_walls()を対応させるラッパー
+def chipai(tile_list, kariton_order):
+    log_title("砌牌")
+    return build_walls(tile_list, kariton_order)
+
+# 壁牌表示のフォーマット
+def show_wall(player):
+    logger.log(f"【{player.wind}家　{player.name}（{player.seat}席）の壁牌】")
+    logger.log("上段：" + ", ".join(player.wall.upper_row()))
+    logger.log("下段：" + ", ".join(player.wall.lower_row()))
+
+# 全員分の壁牌を風の並び順で表示
+def show_all_walls(kariton_order):
+    for wind in wind_order:
+        for side, player in kariton_order.items():
+            if player.wind == wind:
+                show_wall(player)
+
+# 開門表示
+def show_kaimen_wall(player, total):
+    log_title("開門")
+    idx = len(player.wall.columns) - total
+
+    upper = player.wall.upper_row()
+    lower = player.wall.lower_row()
+
+    upper.insert(idx, "   開門位置   ")
+    lower.insert(idx, "   開門位置   ")
+
+    logger.log(f"【{player.wind}家　{player.name}（{player.seat}席）の壁牌】")
+    logger.log("上段：" + ", ".join(upper))
+    logger.log("下段：" + ", ".join(lower))
+
+# サイコロの出目結果を一度だけ記録する
+def log_dice(roll_purpose, roller_name, die1, die2, result_message):
+    logger.log(f"\n─── {roll_purpose} の為に {roller_name} がサイコロを振りました……")
+    logger.log(f"{die1}、{die2} ＝ 出目合計 {die1 + die2}")
+    logger.log(result_message)
+
+# 表示と処理を分けるの原則の為のその両方の呼び出し
+def show_logic():
+    # プレイヤー生成
+    players = create_players()
+    log_title("今回の参戦プレイヤー")
+    logger.log(", ".join(p.name for p in players))
+
+    # 仮東決定
+    kariton_order, mixer = decide_kariton(players)
+
+    log_title("風牌を混ぜる名誉ある人")
+    logger.log(mixer.name)
+
+    show_drawn_winds(players)
+
+    # 仮東表示
+    kariton = next(p for p in players if p.is_kariton)
+    log_title("仮東および仮東が今いる席は")
+    logger.log(f"{kariton.name}　{kariton.seat}")
+
+    logger.log(f"仮東 {kariton.name} の席 {kariton.seat} に起家マークを仮置きします")
+
+    log_title("プレイヤーは牌に従って着席ください")
+    show_seating_by_initial_wind(kariton_order)
+
+    # 仮親決定
+    east_side, temp_target_side, temp_total, temp_d1, temp_d2 = decide_temp_parent(
+        kariton_order
+    )
+
+    east_player = kariton_order[east_side]
+    temp_parent = kariton_order[temp_target_side]
+
+    log_dice("仮親決定", f"仮東 {east_player.name}", temp_d1, temp_d2,
+        f"サイコロ判定で仮親は {temp_parent.name} (席 {temp_target_side})")
+
+    # 親決定
+    real_parent_side, real_parent, real_total, real_d1, real_d2 = decide_real_parent(
+        kariton_order, temp_target_side
+    )
+
+    log_dice(f"親決定", f"仮親 {temp_parent.name}", real_d1, real_d2,
+        f"サイコロ判定で親は {real_parent.name} (席 {real_parent_side})" + "\n" +
+        f"親 {real_parent.name} の席 {real_parent_side} に起家マークを置きます")
+
+    # 席・場風確定
+    kariton_order = assign_seats_after_parent_decided(
+        kariton_order, real_parent_side
+    )
+
+    log_title("場風は以下の様に決定されました")
+    show_seating_by_wind(kariton_order)
+
+    logger.log(
+        f"親 {real_parent.name} の席 {real_parent_side} に起家マークを置きます"
+    )
+
+    # 洗牌
+    tiles = shipai()
+
+    # 砌牌
+    chipai(tiles, kariton_order)
+
+    # 壁牌表示（東南西北順）
+    show_all_walls(kariton_order)
+
+    # 開門
+    target_player, _, _, total, kaimen_d1, kaimen_d2 = kaimen(real_parent, kariton_order)
+
+    log_dice(f"開門", real_parent.name, kaimen_d1, kaimen_d2,
+        f"開門する壁牌は {target_player.wind}家 {target_player.name}（{target_player.seat}席）" + 
+        "\n" + f"開門位置は 右から{total}列目です")
+
+    show_kaimen_wall(target_player, total)
+
+# ===============================
+# メイン処理
+# ===============================
+if __name__ == "__main__":
+    show_logic()
+
+
+
