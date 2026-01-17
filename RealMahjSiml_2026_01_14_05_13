@@ -1,0 +1,102 @@
+import random
+
+# ===============================
+# デバッグ出力ラッパー
+# ===============================
+class Logger:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+
+    def log(self, *args, **kwargs):
+        if self.enabled:
+            # 文字列を整形して出力
+            formatted_args = []
+            for arg in args:
+                if isinstance(arg, list):
+                    # リストならカンマ区切りで文字列化
+                    formatted_args.append(", ".join(str(a) for a in arg))
+                elif isinstance(arg, dict):
+                    # 辞書なら key:value の形式で文字列化
+                    formatted_args.append(", ".join(f"{k}:{v}" for k, v in arg.items()))
+                else:
+                    formatted_args.append(str(arg))
+            print(*formatted_args, **kwargs)
+
+logger = Logger(enabled=True)
+
+# ===============================
+# 麻雀卓の座標定義
+# ===============================
+sides = {"A": (1,0), "B": (0,-1), "C": (-1,0), "D": (0,1)}
+
+# 画面座標系に合わせた時計回り・反時計回り
+clockwise_order = ["A", "D", "C", "B"]
+counter_clockwise_order = ["A", "B", "C", "D"]
+
+def next_clockwise(side):
+    idx = clockwise_order.index(side)
+    return clockwise_order[(idx + 1) % 4]
+
+def next_counter_clockwise(side):
+    idx = counter_clockwise_order.index(side)
+    return counter_clockwise_order[(idx + 1) % 4]
+
+# ===============================
+# プレイヤー生成
+# ===============================
+kana_chars = list("アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポ")
+
+def generate_player_name():
+    return "".join(random.choices(kana_chars, k=2))
+
+def create_players():
+    players = [{"name": generate_player_name(), "type": "CPU"} for _ in range(3)]
+    players.append({"name": "あなた", "type": "Human"})
+    random.shuffle(players)
+    logger.log("生成されたプレイヤー", [p["name"] for p in players])
+    return players
+
+# ===============================
+# 仮東（kariton）決定処理
+# ===============================
+wind_tiles = ["東", "南", "西", "北"]
+
+def decide_kariton(players):
+    # 風牌を混ぜる人（仮親）をランダム選定
+    mixer = random.choice(players)
+    logger.log(f"風牌を混ぜる人", mixer['name'])
+
+    # 風牌を引く（シャッフルして配る）
+    drawn_winds = random.sample(wind_tiles, 4)
+    for player, wind in zip(players, drawn_winds):
+        player["wind"] = wind
+    logger.log("引いた風牌", {p['name']: p['wind'] for p in players})
+
+    # 仮東をランダムに決定
+    east_player = next(p for p in players if p["wind"] == "東")
+    east_side = random.choice(["A", "B", "C", "D"])
+    kariton_order = {east_side: east_player}
+    logger.log(f"仮東（kariton）は", f"{east_player['name']} で辺 {east_side}")
+
+    # 残りの南・西・北を仮東を起点に時計回りで配置
+    side_sequence = []
+    current_side = east_side
+    for wind in ["南", "西", "北"]:
+        current_side = next_clockwise(current_side)  # 右隣に座るイメージ
+        side_sequence.append(current_side)
+    for wind, side in zip(["南", "西", "北"], side_sequence):
+        player = next(p for p in players if p["wind"] == wind)
+        kariton_order[side] = player
+
+    logger.log("辺ごとのプレイヤー割り当て")
+    for side, player in kariton_order.items():
+        logger.log(f"{side}", f"{player['name']} ({player['wind']})")
+    
+    return kariton_order, mixer
+
+# ===============================
+# メイン処理例
+# ===============================
+if __name__ == "__main__":
+    players = create_players()
+    kariton_order, mixer = decide_kariton(players)
