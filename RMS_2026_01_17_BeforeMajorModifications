@@ -1,713 +1,890 @@
-import time
+# RMS_2026_01_17_BeforeMajorModifications
+#   ・まずこれは動かないし、必要修正箇所は山ほどある
+#   ・今後の変更予定など
+#     ・新旧混在→git管理しだしたので次のファイルでは旧は削除して良い
+#     ・リアル麻雀では砌牌時点で壁牌の物理的位置が決定している→再現する
+#     ・チョンチョンは配牌4周目で各人が一枚取る→親だけ5周目を取るでも再現できるが、実際のチョンチョンは親が4周目で2枚取るので、たとえ結果が同じでもシミュレーションとしてそこは再現する
+#     ・LogManagerを廃止してUIをイベントを消費する形にする　それに合わせて処理と描画の結合部分を剥がしていく
+#     ・Diceや、今後実装するであろう点棒などについても、MahjongTableが持つべきかもしれないね
+#     ・多くのことはMahjongTableを通じて行われる形にするが、その役割、関心、責務には常に注意を向け、神クラスにならない様に。
+#   ・まぁその他はwikiに書くか
+
 import random
-from abc import ABC, abstractmethod
-import inspect
 
-# -----------------------------------------------
-# イベントタイプ定数識別子
-# -----------------------------------------------
-TIMEOUT_DETECTED                = "watchdog:タイムアウト防止"
-STATE_MACHINE_NOT_PROGRESSING   = "StateMachine が進行しませんでした"
-FAIL_SAFE_MAX_LOOP_COUNT        = "Fail-safe:無限ループ防止"
-INPUT_AVAILABILITY              = "ユーザーの入力が無効になっています"
-NEXT_PHASE_NOT_FOUND_1          = "次のフェーズはありません1"
-NEXT_PHASE_NOT_FOUND_2          = "次のフェーズはありません2"
+# ===============================
+# デバッグ出力ラッパー
+# ===============================
+class Logger:
+    def __init__(self, enabled=True):
+        self.enabled = enabled
 
-GAME_START                      = "ゲームを開始します"
-GAME_END                        = "ゲームを終了します"
+    def log(self, *args, **kwargs):
+        if self.enabled:
+            formatted_args = []
+            for arg in args:
+                if isinstance(arg, list):
+                    formatted_args.append(", ".join(str(a) for a in arg))
+                elif isinstance(arg, dict):
+                    formatted_args.append(", ".join(f"{k}:{v}" for k, v in arg.items()))
+                else:
+                    formatted_args.append(str(arg))
+            print(*formatted_args, **kwargs)
 
-TITLE_SCENE_START               = "ここはそう、タイトルメニュー画面"
-TITLE_SCENE_END                 = "タイトルメニュー画面を終えますぞ"
+logger = Logger(enabled=True)
 
-MATCH_SCENE_START               = "対局開始でっせ"
-MATCH_SCENE_END                 = "対局終了ですわ"
+# ===============================
+# ゲームの段階
+# ===============================
+from enum import Enum, auto
 
-RESULT_SCENE_START               = "試合結果ですよ"
-RESULT_SCENE_END                 = "試合結果さよなら"
+class GamePhase(Enum):
+    INIT = auto()
+    KARITON = auto()
+    TEMP_PARENT = auto()
+    REAL_PARENT = auto()
+    WALL_BUILD = auto()
+    KAIMEN = auto()
+    DONE = auto()
 
-WIND_TILE_SHUFFLE_PHASE_START   = "風牌シャッフルフェイズが開始されました"
-WIND_TILE_SHUFFLED              = "風牌はシャッフルされました"
-WIND_TILE_SHUFFLE_PHASE_END     = "風牌シャッフルフェイズが終了しました"
+# ===============================
+# 順番と座標 ＝ OrderAndCoordinates
+# ===============================
+class TableOrder:
+    wind_order = ["東", "南", "西", "北"]                             # 風の並び番
+    sides = {"A": (1, 0), "B": (0, -1), "C": (-1, 0), "D": (0, 1)}  # 卓の座標定義
+    clockwise_order = ["A", "D", "C", "B"]                          # 画面座標系に合わせた時計回り
+    counter_clockwise_order = ["A", "B", "C", "D"]                  # 同じくの反時計回り
 
-WIND_TILE_SELECTION_PHASE_START = "風牌選択フェイズが開始されました"
-WIND_TILE_SELECTION_PHASE_END   = "風牌選択フェイズが終了しました"
-WIND_TILE_SELECTION_VALID       = "風牌が選ばれました"
-WIND_TILE_SELECTION_INVALID     = "選んだ風牌は無効でした。ランダムで選びます"
-WIND_TILE_RANDOM_CHOOSE         = "風牌をランダムで選びました"
-WIND_TILE_SELECTION_NONE        = "風牌が無くて選べません"
+    # 時計回り
+    @staticmethod
+    def next_clockwise(side):
+        idx = TableOrder.clockwise_order.index(side)
+        return TableOrder.clockwise_order[(idx + 1) % 4]
 
-# -----------------------------------------------
-# デバッグ用
-# -----------------------------------------------
+    # 半時計回り
+    @staticmethod
+    def next_counter_clockwise(side):
+        idx = TableOrder.counter_clockwise_order.index(side)
+        return TableOrder.counter_clockwise_order[(idx + 1) % 4]
 
-# グローバルのデバッグフラグ
-DEBUG = False # True
+# ===============================
+# データクラスインポート
+# ===============================
+from dataclasses import dataclass, field
+from typing import List
 
-class Debug:
-    print_call_counter = 0
-    
-    @classmethod
-    def print(cls, obj, msg: str = None):
-        """オブジェクト obj のメソッドから呼ばれたときのデバッグ出力"""
-        if not DEBUG:
-            return
+# ===============================
+# 各種イベントオブジェクトの定義
+# ===============================
+# 仮東決めイベントオブジェクト
+@dataclass
+class KaritonDecisionEvent:
+    kariton_player: Player
+    mixer: Player
 
-        cls.print_call_counter += 1
+# 親決めイベントオブジェクト
+@dataclass
+class ParentDecisionEvent:
+    temp_parent: Player
+    parent: Player
+    temp_parent_decision_dice: tuple[int, int]
+    parent_decision_dice: tuple[int, int]
 
-        # 呼び出し元のフレームを取得
-        frame = inspect.currentframe().f_back
-        lineno = frame.f_lineno
-        method_name = frame.f_code.co_name
-        class_name = obj.__class__.__name__ if obj else "Global"
+# 洗牌イベントオブジェクト
+@dataclass(frozen=True)
+class ShipaiEvent:
+    tiles: List[str]
 
-        print(f"debug_print ...    | 行: {lineno} | 何処: {class_name:<18} の {method_name:<12} | {cls.print_call_counter}回目 | 補足 : {msg}")
+# 砌牌イベントオブジェクト
+@dataclass(frozen=True)
+class ChipaiEvent:
+    player: str
+    wall_columns: int  # 何列積んだか
 
-# -----------------------------------------------
-# イベントクラス
-# -----------------------------------------------
-class Event:
-    """イベントの基底クラスでありゲームイベントのクラス"""
-    def __init__(self, event_type, **kwargs):
-        self.event_type = event_type
-        self.extra_data = kwargs
+# 開門イベントオブジェクト
+@dataclass(frozen=True)
+class KaimenEvent:
+    parent: str
+    target: str
+    total: int
+    d1: int
+    d2: int
 
-class LogEvent(Event):
-    """表示イベント　ログメッセージイベントのクラス"""
-    def __init__(self, event_type, **kwargs):
-        super().__init__(event_type, **kwargs)
+# 配牌イベントオブジェクト
+@dataclass(frozen=True)
+class HaipaiEvent:
+    player: str
+    tiles: List[str]
 
-class SystemEvent(Event):
-    """システムイベントクラス　入力可否判定結果等を含む"""
-    def __init__(self, event_type, description, **kwargs):
-        super().__init__(event_type, **kwargs)
-        self.description = description
+# ドラ表示イベントオブジェクト
+@dataclass(frozen=True)
+class DoraRevealedEvent:
+    indicator: str
+    dora: str
 
-# -----------------------------------------------
-# イベント履歴
-# -----------------------------------------------
+# ダイスロール結果
+@dataclass(frozen=True)
+class DiceResult:
+    target_seat: str
+    d1: int
+    d2: int
+    total: int 
 
-class EventHistory:
-    """イベント履歴　三種のイベントを別々に持つ"""
+# ===============================
+# イベント管理クラス
+# ===============================
+class EventManager:
     def __init__(self):
-        self.events = []
-        self.log_events = []
-        self.system_events = []
+        self.events: List = []
 
-    def add_event(self, event):
-        if isinstance(event, LogEvent):
-            self.add_log_event(event)
-        elif isinstance(event, SystemEvent):
-            self.system_events.append(event)
-        else:
-            self.events.append(event)
+    def push(self, event):
+        self.events.append(event)
 
-    def add_log_event(self, log_event):
-        self.log_events.append(log_event)
+# ===============================
+# サイコロ判定処理
+# ===============================
+class Dice:
+    @staticmethod
+    def roll():
+        return random.randint(1, 6), random.randint(1, 6)
 
-    def get_events_all(self):
-        return self.events + self.log_events + self.system_events
-
-    def get_events(self, event_class_type=None):
-        """イベントをタイプ指定で取得。指定がなければすべてのイベントを返す"""
-        if event_class_type is None:
-            # 全てのイベントを返す
-            return self.events + self.log_events + self.system_events
-        elif event_class_type == LogEvent:
-            # LogEvent型のイベントだけ返す
-            return self.log_events
-        elif event_class_type == SystemEvent:
-            # SystemEvent型のイベントだけ返す
-            return self.system_events
-        elif event_class_type == Event:
-            # Event型のイベントだけ返す
-            return [event for event in self.events if type(event) == Event]
-        else:
-            return []    
-
-    def get_event_by_type(self, event_type):
-        return [event for event in self.events if event.event_type == event_type] + \
-               [event for event in self.log_events if event.event_type == event_type] + \
-               [event for event in self.system_events if event.event_type == event_type]
-
-# -----------------------------------------------
-# イベントバス
-# -----------------------------------------------
-
-class EventBus:
-    """イベントバス"""
-    def __init__(self, event_history):
-        self.subscribers = {}
-        self.event_history = event_history
-
-    def subscribe(self, event_type, handler):
-        if event_type not in self.subscribers:
-            self.subscribers[event_type] = []
-        self.subscribers[event_type].append(handler)
-
-    def publish(self, event: Event):
-        """イベントの発行"""
-        if event.event_type in self.subscribers:
-            for handler in self.subscribers[event.event_type]:
-                handler(event)
-        self.__add_event_to_event_history__(event)
-
-    def __add_event_to_event_history__(self, event):
-        self.event_history.add_event(event)
-
-# -----------------------------------------------
-# ログイベントのリスナー　ここでログイベントを表示する
-# -----------------------------------------------
-
-class LogEventListener:
-    """ログイベントのリスナー"""
-    def __init__(self, async_mode=False):
-        self.async_mode = async_mode
-
-    def handle_log_by_sync(self, log_event: LogEvent):
-        """同期的にログを表示する"""
-        self.display_log_sync(log_event)
-
-    def display_log_sync(self, log_event: LogEvent):
-        print(f"[LOG] {log_event.event_type}: {log_event.extra_data}")
-
-    def handle_log_by_event_type(self, log_event: LogEvent):
-        """ログイベントを処理"""
-        event_type = log_event.event_type  # イベントタイプを変数に保存
-
-        event_messages = {
-            FAIL_SAFE_MAX_LOOP_COUNT        : FAIL_SAFE_MAX_LOOP_COUNT,
-            INPUT_AVAILABILITY              : INPUT_AVAILABILITY,
-            NEXT_PHASE_NOT_FOUND_1          : NEXT_PHASE_NOT_FOUND_1,
-            NEXT_PHASE_NOT_FOUND_2          : NEXT_PHASE_NOT_FOUND_2,
-            GAME_START                      : GAME_START,
-            GAME_END                        : GAME_END,
-            TITLE_SCENE_START               : TITLE_SCENE_START,
-            TITLE_SCENE_END                 : TITLE_SCENE_END,
-            MATCH_SCENE_START               : MATCH_SCENE_START,
-            MATCH_SCENE_END                 : MATCH_SCENE_END,
-            RESULT_SCENE_START              : RESULT_SCENE_START,
-            RESULT_SCENE_END                : RESULT_SCENE_END,
-            WIND_TILE_SHUFFLE_PHASE_START   : WIND_TILE_SHUFFLE_PHASE_START,
-            WIND_TILE_SHUFFLED              : WIND_TILE_SHUFFLED,
-            WIND_TILE_SHUFFLE_PHASE_END     : WIND_TILE_SHUFFLE_PHASE_END,
-            WIND_TILE_SELECTION_PHASE_START : WIND_TILE_SELECTION_PHASE_START,
-            WIND_TILE_SELECTION_PHASE_END   : WIND_TILE_SELECTION_PHASE_END,
-            WIND_TILE_SELECTION_VALID       : WIND_TILE_SELECTION_VALID,
-            WIND_TILE_RANDOM_CHOOSE         : WIND_TILE_RANDOM_CHOOSE,
-            WIND_TILE_SELECTION_INVALID     : WIND_TILE_SELECTION_INVALID,
-            WIND_TILE_SELECTION_NONE        : WIND_TILE_SELECTION_NONE
+    @staticmethod
+    def get_target_player_by_total(roller_seat, total):
+        """サイコロ合計値から対象プレイヤーの辺を返す"""
+        move_table = {
+            (5, 9): 0,
+            (2, 6, 10): 1,
+            (3, 7, 11): 2,
+            (4, 8, 12): 3
         }
 
-        handled_message = event_messages.get(event_type, "未定義のログイベント")
-        
-        self._decorate_fixed_print(handled_message)
-        
-    FIXED_LINE = "─" * 8    # 固定8文字罫線（罫線は全角文字、幅2）
-    FIXED_SPACE = "　" * 8  # 固定8文字スペース（全角スペース、幅2）
-    # 左端+左スペースの幅（固定） 全角なので*2する
-    LEFT_WIDTH = len(FIXED_LINE) * 2 + len(FIXED_SPACE) * 2   #最初の罫線とスペース
-    RIGHT_WIDTH = len(FIXED_SPACE) * 2 + len(FIXED_LINE) * 2  # 最後のスペースと罫線
-    STRING_WIDTH = LEFT_WIDTH + RIGHT_WIDTH + 40              # 全体幅（ここに合わせて内容が調整される）
+        steps = None
+        for nums, step in move_table.items():
+            if total in nums:
+                steps = step
+                break
 
-    # 全角文字と半角文字を手動で区別して幅を計算
+        steps = next(step for nums, step in table.items() if total in nums)
+
+        # 反時計回りの順に従って対象者を決定
+        idx = TableOrder.counter_clockwise_order.index(roller_seat)
+        target_side = TableOrder.counter_clockwise_order[(idx + steps) % 4]
+        return target_side
+
     @staticmethod
-    def calculate_width(msg: str) -> int:
-        width = 0
-        for char in msg:
-            if len(char.encode('utf-8')) > 1:  # 2バイト以上なら全角
-                width += 2                     # 全角文字は幅2
-            else:  # 半角文字は1
-                width += 1
-        return width
+    def roll_and_get_target(roller_seat):
+        """サイコロを1回振り、対象の席と合計値とダイスそれぞれの値を返す。純粋な手続きの共通化"""
+        d1, d2 = Dice.roll()
+        total = d1 + d2
+        target = Dice.get_target_player_by_total(roller_seat, total)
+        return target, total, d1, d2
 
-    def _decorate_fixed_print(self, handled_message: str):
-        # 中央部分の内容の幅を計算（全角と半角を考慮）
-        central_len = self.calculate_width(handled_message)
+    # DiceResult = namedtuple("DiceResult", "target_seat d1 d2 total")
 
-        # 残りのスペースを計算（右側の可変スペース）
-        total_used_width = self.LEFT_WIDTH + central_len + self.RIGHT_WIDTH
-        right_padding = self.STRING_WIDTH - total_used_width
-        
-        # 全角スペースを挿入するので、「可変スペースの数」は整数除算で1/2にする
-        right_padding //= 2
-        
-        # 右側スペースがマイナスにならないように調整
-        if right_padding < 0:
-            right_padding = 0  # 長すぎる場合はそのまま
-        
-        right_paffing_spases = '　' * right_padding
-        
-        # 結果のデコレートした文字列
-        decorated = f"{self.FIXED_LINE}{self.FIXED_SPACE}{handled_message}{right_paffing_spases}{self.FIXED_SPACE}{self.FIXED_LINE}"
-        print(decorated)
+    # def roll_for_seat(roller_seat) -> DiceResult:
+    #     d1, d2 = Dice.roll()
+    #     total = d1 + d2
+    #     target_seat = Dice.target_seat_from_total(roller_seat, total)
+    #     return DiceResult(target_seat, d1, d2, total)
 
-# -----------------------------------------------
-# ログイベントリスナーのセットアップ　event_typeでリスナーをサブスクライブする
-# -----------------------------------------------
+    def roll_for_seat(roller_seat) -> DiceResult:
+        d1, d2 = Dice.roll()
+        total = d1 + d2
+        target_seat = Dice.target_seat_from_total(roller_seat, total)
+        return DiceResult(target_seat=target_seat, d1=d1, d2=d2, total=total)
 
-class LogEventListenerSetup:
-    """ログリスナーのセットアップクラス"""
-    def __init__(self, event_bus):
-        self.event_bus = event_bus
-        self.log_listener = LogEventListener()
+# ===============================
+# 仮東決め、仮親決め、親決め、場風割り当てを行う
+#     →神クラス臭。分割を要検討
+#     →少なくとも名が体を表していない。要改名かと（RoundSetupServiceなど）
+#     →それにseat_to_playerを抱え込むより外部に吐き出した方が他のクラスの参照が楽だったり意味的に自然では
+#     ※このクラスだけテスト的にコメントをかなり書いてみる
+# ===============================
+class SeatingManager:
+    def __init__(self, players):
+        self.players = players
+        self.seat_to_player = {}  # 元seat_assignment 他案seating、seated_players
 
-    def do(self):
-        """リスナーをイベントバスに登録"""
-        subscribe_target_types = [
-            FAIL_SAFE_MAX_LOOP_COUNT,
-            INPUT_AVAILABILITY,
-            NEXT_PHASE_NOT_FOUND_1,
-            NEXT_PHASE_NOT_FOUND_2,
-            GAME_START,
-            GAME_END,
-            TITLE_SCENE_START,
-            TITLE_SCENE_END,
-            MATCH_SCENE_START,
-            MATCH_SCENE_END,
-            RESULT_SCENE_START,
-            RESULT_SCENE_END,
-            WIND_TILE_SHUFFLE_PHASE_START,
-            WIND_TILE_SHUFFLED,
-            WIND_TILE_SHUFFLE_PHASE_END,
-            WIND_TILE_SELECTION_PHASE_START,
-            WIND_TILE_SELECTION_PHASE_END,
-            WIND_TILE_SELECTION_VALID,
-            WIND_TILE_SELECTION_INVALID,
-            WIND_TILE_RANDOM_CHOOSE,
-            WIND_TILE_SELECTION_NONE
-        ]
+    # 風牌を用意
+    wind_tiles = ["東", "南", "西", "北"]
 
-        for target_type in subscribe_target_types:
-            self.event_bus.subscribe(target_type, self.log_listener.handle_log_by_event_type)
+    # 席からプレイヤーを得る
+    def player_at(self, seat):
+        return self.seat_to_player[seat]
 
-# -----------------------------------------------
-# 状態遷移システム（State Machine）
-# -----------------------------------------------
+    # 仮東の決定
+    def decide_kariton(self) -> KaritonDecisionEvent:
+        # 混ぜた風牌を各人が取る
+        mixer = random.choice(self.players)        # 風牌を混ぜる人を乱数で選定
+        drawn = random.sample(self.wind_tiles, 4)  # 風牌集合を乱数で混ぜる
+        for p, w in zip(self.players, drawn):      # プレイヤーに混ぜ済み風牌集合をzipで割り当て
+            p.initial_wind = w                     # プレイヤーの初期風配置に風牌を割り当てる部分
 
-class State(ABC):
-    """State==Phaseの基底クラス"""
-    @abstractmethod
-    def enter(self):
-        pass
+        # 仮東と仮東の席が確定
+        kariton_player = next(p for p in self.players if p.initial_wind == "東")  # 仮東のプレイヤーを得る
+        kariton_player.seat = random.choice(["A", "B", "C", "D"])                # 仮東の座席を乱数決定
+        kariton_player.is_kariton = True                                         # 仮東フラグを立てる
 
-    @abstractmethod
-    def exit(self):
-        pass
+        # 各人が取得風牌に基づいて座席に座る
+        self.seat_to_player[kariton_player.seat] = kariton_player        # 席から人辞書に仮東とその席を登録
+        seat = kariton_player.seat                                      # 基準となる仮東の席をseatに設定
+        for wind in ["南", "西", "北"]:                                   # wind in 南西北順にfor処理する
+            seat = TableOrder.next_counter_clockwise(seat)               # seatの反時計回りで次の席をseatに
+            p = next(p for p in self.players if p.initial_wind == wind)  # 初期風が現在のwindの人を走査検索
+            p.seat = seat                                                # プレイヤーの席にseatをセット
+            self.seat_to_player[seat] = p                                # 席から人辞書[席]にプレイヤーを登録
 
-    @abstractmethod
-    def update(self):
-        pass
+        # return mixer
+        return KaritonDecisionEvent(
+            kariton_player=kariton_player,
+            mixer=mixer
+        )
 
-    @abstractmethod
-    def is_completed(self):
-        pass
-    
-    @abstractmethod
-    def reset(self):
-        pass
+    # 仮親決定と親決定
+    def decide_parent(self) -> ParentDecisionEvent:
+        # 仮親決定部
+        kariton_seat = next(s for s, p in self.seat_to_player.items() if p.is_kariton)  # 仮東の席を得る
+        temp_parent_seat, _, d1, d2 = Dice.roll_and_get_target(kariton_seat)            # 仮親決賽,仮親席得
+        temp_parent = self.seat_to_player[temp_parent_seat]                             # 仮親=辞書[仮親席]
 
-# -----------------------------------------------
-# 状態遷移システム（State Machine）
-# -----------------------------------------------
+        # 親決定部
+        parent_seat, _, rd1, rd2 = Dice.roll_and_get_target(temp_parent.seat)  # 親決賽振り、親席得る
+        parent = self.seat_to_player[parent_seat]                              # 親＝席→人辞書[親席]
+        parent.is_parent = True                                                # 親の親フラグをオン
 
-class StateMachine:
-    """状態遷移システム"""
-    def __init__(self, states, event_bus):
-        self.states = states
-        self.event_bus = event_bus
-        self.current_index = 0
-        self.current_state = None
-        self.is_finished = False
-        self.step_count = 0
-        self.max_steps = 20
+        self.assign_winds(parent.seat)
 
-    def start(self):
-        if not self.states:
-            self.is_finished = True
-            return
-        self.current_state = self.states[0]
-        self.current_state.enter()
+        # 仮親、親、仮親決定時の出目2個、親決定時の出目2個を返す
+        return ParentDecisionEvent(
+            temp_parent=temp_parent,
+            parent=parent,
+            temp_parent_decision_dice=(d1, d2),
+            parent_decision_dice=(rd1, rd2),
+        )
 
-    def update(self):
-        if self.watchdog(): return
+    # 全プレイヤーに場風を割り当てる
+    def assign_winds(self, parent_seat):
+        parent = self.seat_to_player[parent_seat]                    # 親=席→人辞書[親席]
+        parent.wind = "東"                                           # 親に東の場風を割り当て
+        idx = TableOrder.counter_clockwise_order.index(parent_seat)  # インデックスに親席を設定
+        for wind in ["南", "西", "北"]:                               # wind in 南西北でfor
+            idx = (idx + 1) % 4                                      # idxを1進め↓その人の風を↑に.
+            self.seat_to_player[TableOrder.counter_clockwise_order[idx]].wind = wind
 
-        if self.is_finished:
-            return
-        if self.current_state:
-            self.current_state.update()
-            if self.current_state.is_completed():
-                self.change_state()
+    # ダイスで座席を得るのでは無くターゲットプレイヤーを得るラッパーメソッド
+    def target_player_by_dice(self, roller_seat, d1, d2):
+        target_seat = Dice.target_seat_from_total(roller_seat, d1 + d2)
+        return self.player_at(target_seat)
 
-    def change_state(self):
-        if self.current_state.is_completed():
-            self.current_state.exit()
-            self.current_index += 1
-            if self.current_index >= len(self.states):
-                self.is_finished = True
-            else:
-                self.current_state = self.states[self.current_index]
-                self.current_state.enter()
-            
-    def reset(self):
-        self.current_index = 0
-        self.current_state = self.states[0] if self.states else None
-        self.is_finished = False
-        for state in self.states:
-            if hasattr(state, "reset"):
-                state.reset()
+# ===============================
+# 卓上。壁牌やらが置かれる物理場。
+#     WallRIng.Wall及びCursorやWanpai、Rivers、MeldArea等を置く感じか
+# ===============================
+class MahjongTable:
+    def __init__(self, seat_to_player: dict[str, Player], dice: Dice):
+        self.seat_to_player = seat_to_player
 
-    def watchdog(self):
-        self.step_count += 1
-        if self.step_count >= self.max_steps:
-            self.event_bus.publish(
-                SystemEvent(
-                    TIMEOUT_DETECTED,
-                    STATE_MACHINE_NOT_PROGRESSING
-                )
+        self.walls: list[Wall] = []
+        self.wall_ring: WallRing | None = None
+
+        self.seat_to_wall: dict[str, Wall] = {}
+        self.wall_to_seat: dict[Wall, str] = {}
+
+        self.cursor: WallCursor | None = None
+        self.wanpai: Wanpai | None = None
+
+        self.dice = dice
+
+        self.wall_positions = TableOrder.sides  # 壁牌の物理存在位置 ”A”,”B”,”C”,”D”
+        self.wind_positions = []
+
+        self.events: list = []
+
+    # 洗牌
+    def shipai(self):
+        tile_list = [t.strip() for t in tiles.split(",")]
+        random.shuffle(tile_list)
+        self._shuffled_tiles = tile_list
+        self.events.append(ShipaiEvent(tile_list.copy()))
+
+    # 砌牌
+    def chipai(self):
+        wall_in_positions = self.wall_positions.copy()
+        random.shuffle(wall_in_positions)
+
+        walls = []
+        for _ in range(4):
+            columns = []
+            for _ in range(17):
+                columns.append([
+                    self._shuffled_tiles.pop(0),
+                    self._shuffled_tiles.pop(0)
+                ])
+            walls.append(Wall(columns))
+
+        self.walls = walls
+        self.wall_ring = WallRing(walls)
+
+        # 座席順で対応付け　→ 　壁牌の物理存在位置をまだ使用していない
+        for seat, wall in zip(TableOrder.clockwise_order, walls):
+            self.seat_to_wall[seat] = wall
+            self.wall_to_seat[wall] = seat
+
+        for seat, player in self.seat_to_player.items():
+            self.events.append(
+                ChipaiEvent(player=player.name,
+                            wall_columns=self.seat_to_wall[seat].column_count())
             )
-            self.event_bus.publish(LogEvent(FAIL_SAFE_MAX_LOOP_COUNT))
-            self.is_finished = True
-            return True
 
-    def pause(self):
-        pass
+    # 開門
+    def kaimen(self, parent_seat: str):
+        dice_result = Dice.roll_for_seat(parent_seat)
+        target_wall = self.seat_to_wall[dice_result.target_seat]
 
-    def is_in_state(self):
-        pass
+        start_col = target_wall.column_count() - dice_result.total - 1
+        self.cursor = WallCursor(self.wall_ring, target_wall, start_col)
 
-# -----------------------------------------------
-# 風牌シャッフルフェーズ
-# -----------------------------------------------
+        self.wanpai = Wanpai(target_wall.columns[-dice_result.total:])
 
-class WindTileShufflePhase(State):
-    def __init__(self, event_bus, event_history):
-        self.event_bus = event_bus
-        self.event_history = event_history
-        self.shuffle_done = False
+        self.events.append(
+            KaimenEvent(
+                parent=self.seat_to_player[parent_seat].name,
+                target=self.seat_to_player[dice_result.target_seat].name,
+                total=dice_result.total,
+                d1=dice_result.d1,
+                d2=dice_result.d2
+            )
+        )
 
-    def shuffle(self):
-        shuffler = "プレイヤー1"
-        self.shuffle_done = True
-        self.event_bus.publish(Event(WIND_TILE_SHUFFLED, shuffler=shuffler))
-        return shuffler
+    # 配牌（チョンチョン含む）
+    def haipai(self, parent_seat: str):
+        order = []
+        seat = parent_seat
+        for _ in range(4):
+            order.append(self.seat_to_player[seat])
+            seat = TableOrder.next_counter_clockwise(seat)
 
+        # 3周 × 4枚
+        for _ in range(3):
+            for p in order:
+                u, l = self.cursor.take_pair()
+                p.hand_tiles.add(u)
+                p.hand_tiles.add(l)
+
+        # チョンチョン
+        parent = order[0]
+        u1, u2 = self.cursor.take_chonchon()
+        parent.hand_tiles.add(u1)
+        parent.hand_tiles.add(u2)
+
+        # 子
+        order[1].hand_tiles.add(self.cursor.take_single(upper=False))
+        order[2].hand_tiles.add(self.cursor.take_single(upper=True))
+        order[3].hand_tiles.add(self.cursor.take_single(upper=False))
+
+        for p in order:
+            self.events.append(
+                HaipaiEvent(player=p.name,
+                            tiles=p.hand_tiles.tiles.copy())
+            )
+
+# ===============================
+# 使用麻雀牌の定義（基本的に変更禁止：前提や方針がブレるので）
+# ===============================
+tiles = "🀇,🀇,🀇,🀇,🀈,🀈,🀈,🀈,🀉,🀉,🀉,🀉,🀊,🀊,🀊,🀊,🀋赤,🀋,🀋,🀋,🀌,🀌,🀌,🀌,🀍,🀍,🀍,🀍,🀎,🀎,🀎,🀎,🀏,🀏,🀏,🀏,🀙,🀙,🀙,🀙,🀚,🀚,🀚,🀚,🀛,🀛,🀛,🀛,🀜,🀜,🀜,🀜,🀝赤,🀝,🀝,🀝,🀞,🀞,🀞,🀞,🀟,🀟,🀟,🀟,🀠,🀠,🀠,🀠,🀡,🀡,🀡,🀡,🀐,🀐,🀐,🀐,🀑,🀑,🀑,🀑,🀒,🀒,🀒,🀒,🀓,🀓,🀓,🀓,🀔赤,🀔,🀔,🀔,🀕,🀕,🀕,🀕,🀖,🀖,🀖,🀖,🀗,🀗,🀗,🀗,🀘,🀘,🀘,🀘,🀀,🀀,🀀,🀀,🀁,🀁,🀁,🀁,🀂,🀂,🀂,🀂,🀃,🀃,🀃,🀃,🀆,🀆,🀆,🀆,🀅,🀅,🀅,🀅,🀄,🀄,🀄,🀄"
+
+meaning = {
+    "🀇": "1m", "🀈": "2m", "🀉": "3m", "🀊": "4m",
+    "🀋": "5m", "🀌": "6m", "🀍": "7m", "🀎": "8m", "🀏": "9m",
+    "🀋赤": "5mRed",
+
+    "🀙": "1p", "🀚": "2p", "🀛": "3p", "🀜": "4p",
+    "🀝": "5p", "🀞": "6p", "🀟": "7p", "🀠": "8p", "🀡": "9p",
+    "🀝赤": "5pRed",
+
+    "🀐": "1s", "🀑": "2s", "🀒": "3s", "🀓": "4s",
+    "🀔": "5s", "🀕": "6s", "🀖": "7s", "🀗": "8s", "🀘": "9s",
+    "🀔赤": "5sRed",
+
+    "🀀": "ton", "🀁": "nan", "🀂": "sha", "🀃": "pei",
+    "🀆": "haku", "🀅": "hatsu", "🀄": "chun"
+}
+
+# ===============================
+# 壁牌の構造
+# ===============================
+class Wall:
+    def __init__(self, columns: list[list[str]]):
+        self.columns = columns  # [[upper, lower], ...]
+
+    def take_pair(self, col: int):
+        upper, lower = self.columns[col]
+        self.columns[col] = [None, None]
+        return upper, lower
+
+    def take_single(self, col: int, upper: bool):
+        idx = 0 if upper else 1
+        tile = self.columns[col][idx]
+        self.columns[col][idx] = None
+        return tile
+
+    def column_count(self):
+        return len(self.columns)
+
+# ===============================
+# 壁牌4つを輪として見る。
+#     カーソルは持たず、枚数を管理せず、責務は「次の壁はどれかを教える」
+# ===============================
+class WallRing:
+    def __init__(self, ordered_walls: list[Wall]):
+        assert len(ordered_walls) == 4
+        self.walls = ordered_walls
+
+    def next_wall(self, wall: Wall) -> Wall:
+        idx = self.walls.index(wall)
+        return self.walls[(idx + 1) % 4]
+
+# ===============================
+# 壁牌カーソル
+# ===============================
+class WallCursor:
+    def __init__(self, ring: WallRing, start_wall: Wall, start_col: int):
+        self.ring = ring
+        self.wall = start_wall
+        self.col = start_col  # 右端基準
+
+    def _advance_wall(self):
+        self.wall = self.ring.next_wall(self.wall)
+        self.col = self.wall.column_count() - 1
+
+    def take_pair(self):
+        if self.col < 0:
+            self._advance_wall()
+
+        tiles = self.wall.take_pair(self.col)
+        self.col -= 1
+        return tiles
+
+    def take_single(self, upper: bool):
+        if self.col < 0:
+            self._advance_wall()
+
+        tile = self.wall.take_single(self.col, upper)
+
+        # 下段を取ったときだけ列を消費
+        if not upper:
+            self.col -= 1
+
+        return tile
+
+    def take_chonchon(self):
+        first = self.take_single(upper=True)   # self.col -= 1は列を1つ消費（＝下段を空消費）
+        self.col -= 1                          # これでは絶対ダメなのでもう泥臭くやった方がいい。
+        second = self.take_single(upper=True)  # 一応、4周目に親子子子と一枚ずつ取って親だけ5周目を取れば結果はチョンチョンと同じではある。
+        return first, second                   # ただ、たとえ結果が同じでもこれはトコトンリアル麻雀シミュレーションを目指すので、過程をも再現したい。
+
+# ===============================
+# 壁牌の管理
+# ===============================
+class WallManager:
+    def __init__(self, seat_to_player, dice):
+        self.seat_to_player = seat_to_player
+        self.dice = dice
+
+    # 洗牌 = 牌を混ぜる
+    def shipai(self):
+        tile_list = [t.strip() for t in tiles.split(",")]
+        random.shuffle(tile_list)
+        return tile_list
+
+    # 砌牌 = 壁牌を積む
+    def chipai(self, tile_list):
+        for p in self.seat_to_player.values():
+            wall = Wall()
+            for _ in range(17):
+                upper, lower = tile_list.pop(0), tile_list.pop(0)
+                wall.add_column(upper, lower)
+            p.wall = wall
+
+    # 開門 ＝ 切り山の位置決定    遠い将来、割れ目ルールをONに出来るならば、開門担当者==割れ目だからターゲットは必要。そうでなくとも少なくとも開門対象壁牌は特定しなくてはならない。
+    def kaimen(self, parent):
+        target_side, total, d1, d2 = self.dice.roll_and_get_target(parent.seat)
+        target = self.seat_to_player[target_side]
+        return target, total, d1, d2
+
+# ===============================
+# 手牌
+# ===============================
+class HandTiles:
+    def __init__(self):
+        self.tiles = []
+
+    def add(self, tile):
+        self.tiles.append(tile)
+
+    def __len__(self):
+        return len(self.tiles)
+
+    def __repr__(self):
+        return " ".join(self.tiles)
+
+# ===============================
+# 配牌管理
+# ===============================
+class HaipaiManager:
+    def __init__(self, seat_to_player, parent, start_col):
+        self.seat_to_player = seat_to_player
+        self.parent = parent
+        self.cursor = WallCursor(seat_to_player, parent, start_col)
+
+    def players_ccw(self):
+        order = []
+        side = self.parent.seat
+        for _ in range(4):
+            order.append(self.seat_to_player[side])
+            side = TableOrder.next_counter_clockwise(side)
+        return order
+
+    def deal_four_tiles(self):
+        for p in self.players_ccw():
+            for _ in range(2):
+                u, l = self.cursor.take_pair()
+                p.hand.add(u)
+                p.hand.add(l)
+
+    def take_chonchon(self):
+        players = self.players_ccw()
+        parent = players[0]
+
+        # 旧チョンチョンの名残　次以降消す
+        # t1 = self.cursor.take_single(upper=True)
+        # self.cursor.skip_column()
+        # t2 = self.cursor.take_single(upper=True)
+
+        parent.hand.add(t1)
+        parent.hand.add(t2)
+
+    def deal_initial(self):
+        # 3周 × 4枚
+        for _ in range(3):
+            self.deal_four_tiles()
+
+        # 特殊一周
+        players = self.players_ccw()
+
+        # 親：チョンチョン
+        self.take_chonchon()
+
+        # 子
+        players[1].hand.add(self.cursor.take_single(upper=False))
+        players[2].hand.add(self.cursor.take_single(upper=True))
+        players[3].hand.add(self.cursor.take_single(upper=False))
+
+# ===============================
+# チョンチョン実装ガワをテストで作る為のクラス
+# ===============================
+class DealPhase:
+    def execute(self, mahjong_table):
+        self._deal_normal_rounds(mahjong_table, times=3)
+        self._deal_chonchon_round(mahjong_table)
+
+    def _deal_chonchon_round(self, table):
+        parent = table.parent
+        cursor = table.wall_cursor
+
+        # 親だけ特殊
+        parent.hand.add(cursor.take_chonchon_first())
+        parent.hand.add(cursor.take_chonchon_second())
+
+        # 残りは通常1枚ずつ
+        for p in mahjong_table.players_ccw_from(parent):
+            p.hand.add(cursor.take_next())
+
+# ===============================
+# 王牌
+# ===============================
+class Wanpai:
+    def __init__(self, wall_columns):
+        self.columns = wall_columns[:7]
+
+    def dora_indicator(self):
+        return self.columns[2][0]
+
+# ===============================
+# ドラ判定
+# ===============================
+# 絵文字に依るドラ判定
+class DoraIndicator:
+    @staticmethod
+    def next(tile):
+        if tile in "🀇🀈🀉🀊🀋🀌🀍🀎🀏":
+            nums = ["🀇", "🀈", "🀉", "🀊", "🀋", "🀌", "🀍", "🀎", "🀏"]
+            return nums[(nums.index(tile) + 1) % 9]
+
+        if tile in "🀙🀚🀛🀜🀝🀞🀟🀠🀡":
+            nums = ["🀙", "🀚", "🀛", "🀜", "🀝", "🀞", "🀟", "🀠", "🀡"]
+            return nums[(nums.index(tile) + 1) % 9]
+
+        if tile in "🀐🀑🀒🀓🀔🀕🀖🀗🀘":
+            nums = ["🀐", "🀑", "🀒", "🀓", "🀔", "🀕", "🀖", "🀗", "🀘"]
+            return nums[(nums.index(tile) + 1) % 9]
+
+        winds = ["🀀", "🀁", "🀂", "🀃"]
+        if tile in winds:
+            return winds[(winds.index(tile) + 1) % 4]
+
+        dragons = ["🀆", "🀅", "🀄"]
+        return dragons[(dragons.index(tile) + 1) % 3]
+
+
+# ===============================
+# プレイヤークラス
+# ===============================
+kana_chars = list("アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲンガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポ")
+
+
+class Player:
+    def __init__(self, name, type_="CPU"):
+        self.name = name
+        self.type = type_
+        self.initial_wind = None  # 仮で引いた風牌
+        self.seat = None  # A/B/C/D 席（場風とは別）
+        self.wind = None  # 東南西北（最終的な家）
+        self.is_kariton = False
+        self.is_parent = False
+        self.hand_tiles = HandTiles()
+
+    def __repr__(self):
+        return f"{self.name}({self.type}, seat={self.seat}, wind={self.wind})"
+
+    @staticmethod
+    def generate_player_name():
+        return "".join(random.choices(kana_chars, k=random.randint(2, 4)))
+
+
+# ===============================
+# プレイヤーのファクトリー
+# ===============================
+class PlayerFactory:
+    @staticmethod
+    def create_players():
+        players = [Player(Player.generate_player_name()) for _ in range(3)]
+        players.append(Player("あなた", type_="Human"))
+        random.shuffle(players)
+        return players
+
+
+# ===============================
+# 一局単位の管理。状態を進め、Eventを生成（UIに触れない）
+# ===============================
+class Round:
+    def __init__(self, players, dice):
+        self.players = players
+        self.dice = dice
+        self.seating = SeatingManager(players)
+
+    def start(self) -> list:
+        events = []
+
+        kariton_event = self.seating.decide_kariton()
+        events.append(kariton_event)
+
+        parent_event = self.seating.decide_parent()
+        events.append(parent_event)
+
+        mahjong_table = MahjongTable(self.seating.seat_to_player)
+
+        mahjong_table.shipai()
+        mahjong_table.chipai()
+        mahjong_table.kaimen(parent_event.parent.seat)
+        mahjong_table.haipai(parent_event.parent.seat)
+        events = mahjong_table.events
+
+        indicator = table.wanpai.dora_indicator()
+        events.append(
+            DoraRevealedEvent(
+                indicator=indicator,
+                dora=DoraIndicator.next(indicator)
+            )
+        )
+
+        return events
+
+
+# ===============================
+# 司令塔　class Application とも言える
+# ===============================
+class Game:
+    def __init__(self, logger, dice):
+        self.logger = logger
+        self.dice = dice
+        self.players = PlayerFactory.create_players()
+        self.event_mgr = EventManager()
+        self.log_manager = LogManager(logger)
+
+    def run(self):
+        scene = MatchScene(self)
+        scene.enter()
+
+
+# ===============================
+# メイン処理
+# ===============================
+class Scene:
     def enter(self):
-        Debug.print(self)
-        self.event_bus.publish(LogEvent(WIND_TILE_SHUFFLE_PHASE_START))
-        shuffler = self.shuffle()
+        pass
+
+    def update(self):
+        pass
 
     def exit(self):
-        if not self.shuffle_done:
-            self.event_bus.publish(LogEvent(WIND_TILE_SHUFFLE_PHASE_END))
-
-    def update(self):
         pass
 
-    def is_completed(self):
-        return self.shuffle_done
-
-    def reset(self):
-        self.shuffle_done = False
-
-# -----------------------------------------------
-# 風牌選択フェーズ
-# -----------------------------------------------
-
-class WindTileSelectionPhase(State):
-    def __init__(self, event_bus, event_history):
-        self.event_bus = event_bus
-        self.event_history = event_history
-        self.selection_done = False
-
-    def selection(self):
-        shuffled_event = self.event_history.get_event_by_type(WIND_TILE_SHUFFLED)
-        shuffler = shuffled_event[0].extra_data["shuffler"]
-        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_VALID, extra_data="風牌1"))
-        self.selection_done = True
-
-    def enter(self):
-        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_PHASE_START))
-        self.selection()
-
-    def exit(self):
-        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_PHASE_END))
-
-    def update(self):
-        pass
-
-    def is_completed(self):
-        return self.selection_done
-
-    def reset(self):
-        self.selection_done = False
-
-# -----------------------------------------------
-# フェーズ遷移の順序を定義する台本
-# -----------------------------------------------
-
-class PhaseTransitionOrder:
-    """フェーズ遷移の順序を列挙"""
-    phase_names = [
-        WindTileShufflePhase,
-        WindTileSelectionPhase
-    ]
-
-# -----------------------------------------------
-# シーン管理クラス（大きな遷移）
-# -----------------------------------------------
-
-class Scene(ABC):
-    """シーン管理クラス"""
-    def __init__(self, event_bus, event_history):
-        self.event_bus = event_bus
-        self.event_history = event_history
-
-    @abstractmethod
-    def on_enter(self):
-        pass
-
-    @abstractmethod
-    def on_exit(self):
-        pass
-
-    @abstractmethod
-    def update(self):
-        pass
-
-    @abstractmethod
-    def reset(self):
-        pass
-
-    @abstractmethod
-    def is_finished(self):
-        pass
-
-# -----------------------------------------------
-# タイトルメニュー画面シーン
-# -----------------------------------------------
-
-class TitleScene(Scene):
-    def __init__(self, event_bus, event_history):
-        super().__init__(event_bus, event_history)
-        self.event_bus = event_bus
-        self.event_history = event_history
-        self._is_finished = False
-
-    def on_enter(self):
-        self.event_bus.publish(LogEvent(TITLE_SCENE_START))
-
-    def on_exit(self):
-        self.event_bus.publish(LogEvent(TITLE_SCENE_END))
- 
-    def update(self):
-        self.mark_as_finished()
-
-    def reset(self):
-        self._is_finished = False
-
-    def is_finished(self):
-        return self._is_finished
-
-    def mark_as_finished(self):
-        if not self._is_finished:
-            self._is_finished = True
-            
-    def display_menu(self):  # メインメニューの表示
-        pass
-
-# -----------------------------------------------
-# 試合シーン
-# -----------------------------------------------
 
 class MatchScene(Scene):
-    def __init__(self, event_bus, event_history):
-        super().__init__(event_bus, event_history)
-        self.state_machine = StateMachine(
-            [
-                WindTileShufflePhase(event_bus, event_history),
-                WindTileSelectionPhase(event_bus, event_history)
-            ],
-            event_bus
+    def __init__(self, game):
+        self.game = game
+
+    def enter(self):
+        round = Round(self.game.players, self.game.dice)
+        events = round.start()
+        for e in events:
+            self.game.event_mgr.push(e)
+            self.game.log_manager.consume(e)
+            self.game.log_manager.show_all_walls(round.seating.seat_to_player)
+
+
+# ===============================
+# 表示の調整　UI／プレゼンテーション層    もうレガシーすぎて、イベント駆動の為に一回壊す必要がある気がする
+# ===============================
+class LogManager:
+    def __init__(self, logger):
+        self.logger = logger
+
+    def consume(self, event):
+        if isinstance(event, KaritonDecisionEvent):
+            self.logger.log(
+                f"仮東: {event.kariton_player.name} / 混ぜた人: {event.mixer.name}"
+            )
+        elif isinstance(event, ParentDecisionEvent):
+            self.logger.log(
+                f"仮親: {event.temp_parent.name} → 親: {event.parent.name}"
+            )
+        elif isinstance(event, ShipaiEvent):
+            self.logger.log(
+                "洗牌完了"
+            )
+        elif isinstance(event, ChipaiEvent):
+            self.logger.log(
+                f"{event.player} の壁牌：{event.wall_columns} 列"
+            )
+        elif isinstance(event, KaimenEvent):
+            self.logger.log(
+                f"開門：{event.target}（出目 {event.d1}+{event.d2}={event.total}）"
+            )
+        elif isinstance(event, HaipaiEvent):
+            self.logger.log(
+                f"{event.player} 手牌: {' '.join(event.tiles)}"
+            )
+        elif isinstance(event, DoraRevealedEvent):
+            self.logger.log(
+                f"ドラ表示牌: {event.indicator} → ドラ {event.dora}"
+            )
+
+    def show_all_walls(self, seat_to_player):
+        self.logger.log("\n─── 全員の壁牌 ───")
+        for wind in TableOrder.wind_order:
+            for p in seat_to_player.values():
+                if p.wind == wind:
+                    self.logger.log(f"【{p.wind}家 {p.name}】")
+                    self.logger.log("上段：" + " ".join(p.wall.upper_row()))
+                    self.logger.log("下段：" + " ".join(p.wall.lower_row()))
+
+    def log_title(self, title):
+        self.logger.log(f"\n─── {title} ───")
+
+    def log_title_and_contents(self, title, contents):
+        self.log_title(title)
+        self.logger.log(f"\n" + contents)
+
+    # 「引いた風牌」を風の並び順にソート表示
+    def show_drawn_winds(self, players):
+        self.log_title("各々が引いた風牌")
+        sorted_players = sorted(
+            players, key=lambda p: TableOrder.wind_order.index(p.initial_wind))
+        self.logger.log(", ".join(f"{p.name}:{p.initial_wind}" for p in sorted_players))
+
+    # 席表示・場風表示を風の並び順にソート表示
+    def show_seating_by_wind(self, seat_to_player):
+        sorted_items = sorted(
+            kariton_order.items(),
+            key=lambda item: TableOrder.wind_order.index(item[1].wind)
         )
-        self.event_bus = event_bus
-        self.event_history = event_history
-        self._is_finished = False
+        for side, player in sorted_items:
+            self.logger.log(f"{side} {player.name} ({player.wind})")
 
-    def on_enter(self):
-        self.event_bus.publish(LogEvent(MATCH_SCENE_START))
-        self.start_match()
+    # 席表示・場風表示を初期風の並び順にソート表示
+    def show_seating_by_initial_wind(self, seat_to_player):
+        sorted_items = sorted(
+            kariton_order.items(),
+            key=lambda item: TableOrder.wind_order.index(item[1].initial_wind)
+        )
+        for side, player in sorted_items:
+            self.logger.log(f"{side} {player.name} ({player.initial_wind})")
 
-    def on_exit(self):
-        self.event_bus.publish(LogEvent(MATCH_SCENE_END))
+    # サイコロ演出
+    def show_dice(self, roller_name, die1, die2):
+        self.logger.log(f"─── {roller_name} がサイコロを振りました……")
+        self.logger.log(f" {die1}、{die2} ＝ 出目合計 {die1 + die2} ───")
 
-    def update(self):
-        self.state_machine.update()
-        if self.state_machine.is_finished:
-            self.mark_as_finished()
+    # 洗牌結果表示
+    def show_shipai_result(self, tile_list):
+        self.log_title("洗牌")
+        self.logger.log(f"現在の牌並び: {', '.join(tile_list)}")
+        self.logger.log(
+            "──────────────────────────────────────"
+        )
 
-    def reset(self):
-        self.state_machine.reset()
-        self._is_finished = False
+    # 壁牌表示
+    def show_wall(self, player):
+        self.logger.log(f"【{player.wind}家　{player.name}（{player.seat}席）の壁牌】")
+        self.logger.log("上段：" + ", ".join(player.wall.upper_row()))
+        self.logger.log("下段：" + ", ".join(player.wall.lower_row()))
+        self.logger.log(
+            "──────────────────────────────────────"
+        )
 
-    def is_finished(self):
-        return self._is_finished
+    # 全員分の壁牌を風の並び順で表示
+    # def show_all_walls(self, seat_to_player):
+    #     for wind in TableOrder.wind_order:
+    #         for side, player in kariton_order.items():
+    #             if player.wind == wind:
+    #                 self.show_wall(player)
 
-    def mark_as_finished(self):
-        if not self._is_finished:
-            self._is_finished = True
-            
-    def start_match(self):
-        self.state_machine.start()
+    # 開門表示
+    def show_kaimen_wall(self, player, total):
+        self.log_title("開門")
+        idx = len(player.wall.columns) - total
 
-# -----------------------------------------------
-# 試合結果シーン
-# -----------------------------------------------
+        upper = player.wall.upper_row()
+        lower = player.wall.lower_row()
 
-class ResultScene(Scene):
-    def __init__(self, event_bus, event_history):
-        super().__init__(event_bus, event_history)
-        self.event_bus = event_bus
-        self.event_history = event_history
-        self._is_finished = False
+        upper.insert(idx, " 開門位置 ")
+        lower.insert(idx, " 開門位置 ")
 
-    def on_enter(self):
-        self.event_bus.publish(LogEvent(RESULT_SCENE_START))
-        self.show_result()
+        self.logger.log(f"【{player.wind}家　{player.name}（{player.seat}席）の壁牌】")
+        self.logger.log("上段：" + ", ".join(upper))
+        self.logger.log("下段：" + ", ".join(lower))
 
-    def on_exit(self):
-        self.event_bus.publish(LogEvent(RESULT_SCENE_END))
+    # サイコロ演出2 目的の為に、名前が、サイコロを振り、出目二つはこれで合計はこれで、結果こうさ
+    def log_dice(self, roll_purpose, roller_name, die1, die2, result_message):
+        self.logger.log(f"\n─── {roll_purpose} の為に {roller_name} がサイコロを振りました……")
+        self.logger.log(f"{die1}、{die2} ＝ 出目合計 {die1 + die2}")
+        self.logger.log(result_message)
 
-    def update(self):
-        self.mark_as_finished()
-
-    def reset(self):
-        self._is_finished = False
-
-    def is_finished(self):
-        return self._is_finished
-
-    def mark_as_finished(self):
-        if not self._is_finished:
-            self._is_finished = True
-
-    def show_result(self):
-        pass
-
-# -----------------------------------------------
-# シーンの条件分岐などあり得る順番を保持する
-# -----------------------------------------------
-
-class SceneFlow:
-    scene_names = [
-        TitleScene,
-        MatchScene,
-        ResultScene
-    ]
-
-# -----------------------------------------------
-# シーンを遷移させる
-# -----------------------------------------------
-
-class SceneTransitioner:
-    def __init__(self, event_bus, event_history):
-        self.event_bus = event_bus
-        self.scene_order = SceneFlow.scene_names 
-        self.current_scene_index = 0
-        self.current_scene = self.scene_order[self.current_scene_index](event_bus, event_history)
-        self.all_scene_done = False
-        
-    def run(self):
-        """シーンの実行ループを開始"""
-        self.current_scene.on_enter()
-
-        MAX_LOOP = 10
-        loop_count = 0
-
-        while self.current_scene:
-            loop_count += 1
-            if loop_count >= MAX_LOOP:
-                self.event_bus.publish(LogEvent(FAIL_SAFE_MAX_LOOP_COUNT))
-                break        
-
-            self.current_scene.update()
-
-            if self.current_scene.is_finished():
-                self.transition_to_next_scene()
-
-            self.wait_seconds(0.01)
-
-    def transition_to_next_scene(self):
-        """次のシーンに遷移"""
-        self.current_scene.on_exit()
-        self.current_scene_index += 1
-
-        if self.current_scene_index >= len(self.scene_order):  # シーンの順番が終わったら終了
-            self.current_scene = None
-            self.all_scene_done = True
-        else:
-            self.current_scene = self.scene_order[self.current_scene_index](self.current_scene.event_bus, self.current_scene.event_history)
-            self.current_scene.on_enter()
-
-    def wait_seconds(self, second):
-        time.sleep(second)
-
-    def request_scene_change(self, next_scene):
-        """ユーザー操作で強制的に Scene を切り替える"""
-        if self.current_scene:
-            self.current_scene.on_exit()
-        self.current_scene = next_scene
-        self.current_scene.reset()
-        self.current_scene.on_enter()
-
-    def go_to_match_scene(self, restart=False):
-        match_scene = MatchScene(self.event_bus, self.event_history)
-        if restart:
-            match_scene.reset()  # PhaseもStateMachineも初期化
-        self.request_scene_change(match_scene)
-
-# -----------------------------------------------
-# ゲーム管理クラス
-# -----------------------------------------------
-
-class GameSession:
-    """ゲームの進行を管理するクラス"""
-    def __init__(self, event_bus, event_history):
-        self.event_bus = event_bus
-        self.event_history = event_history
-        self.scene_transitioner = None
-
-    def start_game(self):
-        """ゲームの開始処理"""
-        self.scene_transitioner = SceneTransitioner(self.event_bus, self.event_history)
-        self.event_bus.publish(LogEvent(GAME_START))
-        self.scene_transitioner.run()
-        self.end_game()
-
-    def end_game(self):
-        """ゲームの終了処理"""
-        self.event_bus.publish(LogEvent(GAME_END))
-        # if self.scene_transitioner:
-        #    self.scene_transitioner.request_scene_change(None)  # ゲーム終了時にシーン遷移を停止
-
-# -----------------------------------------------
-# ゲーム初期化クラス
-# -----------------------------------------------
-class GameLauncher:
-    def __init__(self):
-        self.event_history = EventHistory()
-        self.event_bus = EventBus(self.event_history)
-        self.log_listener_setup = LogEventListenerSetup(self.event_bus)
-        self.log_listener_setup.do()
-        self.game_session = GameSession(self.event_bus, self.event_history)
-
-    def launch(self):
-        Debug.print(self)
-        self.game_session.start_game()
-
-# -----------------------------------------------
-# 実行
-# -----------------------------------------------
+# ===============================
+# メイン処理
+# ===============================
 if __name__ == "__main__":
-    game_launcher = GameLauncher()  # ゲームの初期化
-    game_launcher.launch()
-    
+    Game(logger, Dice()).run()
+
