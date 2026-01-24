@@ -1,0 +1,713 @@
+import time
+import random
+from abc import ABC, abstractmethod
+import inspect
+
+# -----------------------------------------------
+# イベントタイプ定数識別子
+# -----------------------------------------------
+TIMEOUT_DETECTED                = "watchdog:タイムアウト防止"
+STATE_MACHINE_NOT_PROGRESSING   = "StateMachine が進行しませんでした"
+FAIL_SAFE_MAX_LOOP_COUNT        = "Fail-safe:無限ループ防止"
+INPUT_AVAILABILITY              = "ユーザーの入力が無効になっています"
+NEXT_PHASE_NOT_FOUND_1          = "次のフェーズはありません1"
+NEXT_PHASE_NOT_FOUND_2          = "次のフェーズはありません2"
+
+GAME_START                      = "ゲームを開始します"
+GAME_END                        = "ゲームを終了します"
+
+TITLE_SCENE_START               = "ここはそう、タイトルメニュー画面"
+TITLE_SCENE_END                 = "タイトルメニュー画面を終えますぞ"
+
+MATCH_SCENE_START               = "対局開始でっせ"
+MATCH_SCENE_END                 = "対局終了ですわ"
+
+RESULT_SCENE_START               = "試合結果ですよ"
+RESULT_SCENE_END                 = "試合結果さよなら"
+
+WIND_TILE_SHUFFLE_PHASE_START   = "風牌シャッフルフェイズが開始されました"
+WIND_TILE_SHUFFLED              = "風牌はシャッフルされました"
+WIND_TILE_SHUFFLE_PHASE_END     = "風牌シャッフルフェイズが終了しました"
+
+WIND_TILE_SELECTION_PHASE_START = "風牌選択フェイズが開始されました"
+WIND_TILE_SELECTION_PHASE_END   = "風牌選択フェイズが終了しました"
+WIND_TILE_SELECTION_VALID       = "風牌が選ばれました"
+WIND_TILE_SELECTION_INVALID     = "選んだ風牌は無効でした。ランダムで選びます"
+WIND_TILE_RANDOM_CHOOSE         = "風牌をランダムで選びました"
+WIND_TILE_SELECTION_NONE        = "風牌が無くて選べません"
+
+# -----------------------------------------------
+# デバッグ用
+# -----------------------------------------------
+
+# グローバルのデバッグフラグ
+DEBUG = False # True
+
+class Debug:
+    print_call_counter = 0
+    
+    @classmethod
+    def print(cls, obj, msg: str = None):
+        """オブジェクト obj のメソッドから呼ばれたときのデバッグ出力"""
+        if not DEBUG:
+            return
+
+        cls.print_call_counter += 1
+
+        # 呼び出し元のフレームを取得
+        frame = inspect.currentframe().f_back
+        lineno = frame.f_lineno
+        method_name = frame.f_code.co_name
+        class_name = obj.__class__.__name__ if obj else "Global"
+
+        print(f"debug_print ...    | 行: {lineno} | 何処: {class_name:<18} の {method_name:<12} | {cls.print_call_counter}回目 | 補足 : {msg}")
+
+# -----------------------------------------------
+# イベントクラス
+# -----------------------------------------------
+class Event:
+    """イベントの基底クラスでありゲームイベントのクラス"""
+    def __init__(self, event_type, **kwargs):
+        self.event_type = event_type
+        self.extra_data = kwargs
+
+class LogEvent(Event):
+    """表示イベント　ログメッセージイベントのクラス"""
+    def __init__(self, event_type, **kwargs):
+        super().__init__(event_type, **kwargs)
+
+class SystemEvent(Event):
+    """システムイベントクラス　入力可否判定結果等を含む"""
+    def __init__(self, event_type, description, **kwargs):
+        super().__init__(event_type, **kwargs)
+        self.description = description
+
+# -----------------------------------------------
+# イベント履歴
+# -----------------------------------------------
+
+class EventHistory:
+    """イベント履歴　三種のイベントを別々に持つ"""
+    def __init__(self):
+        self.events = []
+        self.log_events = []
+        self.system_events = []
+
+    def add_event(self, event):
+        if isinstance(event, LogEvent):
+            self.add_log_event(event)
+        elif isinstance(event, SystemEvent):
+            self.system_events.append(event)
+        else:
+            self.events.append(event)
+
+    def add_log_event(self, log_event):
+        self.log_events.append(log_event)
+
+    def get_events_all(self):
+        return self.events + self.log_events + self.system_events
+
+    def get_events(self, event_class_type=None):
+        """イベントをタイプ指定で取得。指定がなければすべてのイベントを返す"""
+        if event_class_type is None:
+            # 全てのイベントを返す
+            return self.events + self.log_events + self.system_events
+        elif event_class_type == LogEvent:
+            # LogEvent型のイベントだけ返す
+            return self.log_events
+        elif event_class_type == SystemEvent:
+            # SystemEvent型のイベントだけ返す
+            return self.system_events
+        elif event_class_type == Event:
+            # Event型のイベントだけ返す
+            return [event for event in self.events if type(event) == Event]
+        else:
+            return []    
+
+    def get_event_by_type(self, event_type):
+        return [event for event in self.events if event.event_type == event_type] + \
+               [event for event in self.log_events if event.event_type == event_type] + \
+               [event for event in self.system_events if event.event_type == event_type]
+
+# -----------------------------------------------
+# イベントバス
+# -----------------------------------------------
+
+class EventBus:
+    """イベントバス"""
+    def __init__(self, event_history):
+        self.subscribers = {}
+        self.event_history = event_history
+
+    def subscribe(self, event_type, handler):
+        if event_type not in self.subscribers:
+            self.subscribers[event_type] = []
+        self.subscribers[event_type].append(handler)
+
+    def publish(self, event: Event):
+        """イベントの発行"""
+        if event.event_type in self.subscribers:
+            for handler in self.subscribers[event.event_type]:
+                handler(event)
+        self.__add_event_to_event_history__(event)
+
+    def __add_event_to_event_history__(self, event):
+        self.event_history.add_event(event)
+
+# -----------------------------------------------
+# ログイベントのリスナー　ここでログイベントを表示する
+# -----------------------------------------------
+
+class LogEventListener:
+    """ログイベントのリスナー"""
+    def __init__(self, async_mode=False):
+        self.async_mode = async_mode
+
+    def handle_log_by_sync(self, log_event: LogEvent):
+        """同期的にログを表示する"""
+        self.display_log_sync(log_event)
+
+    def display_log_sync(self, log_event: LogEvent):
+        print(f"[LOG] {log_event.event_type}: {log_event.extra_data}")
+
+    def handle_log_by_event_type(self, log_event: LogEvent):
+        """ログイベントを処理"""
+        event_type = log_event.event_type  # イベントタイプを変数に保存
+
+        event_messages = {
+            FAIL_SAFE_MAX_LOOP_COUNT        : FAIL_SAFE_MAX_LOOP_COUNT,
+            INPUT_AVAILABILITY              : INPUT_AVAILABILITY,
+            NEXT_PHASE_NOT_FOUND_1          : NEXT_PHASE_NOT_FOUND_1,
+            NEXT_PHASE_NOT_FOUND_2          : NEXT_PHASE_NOT_FOUND_2,
+            GAME_START                      : GAME_START,
+            GAME_END                        : GAME_END,
+            TITLE_SCENE_START               : TITLE_SCENE_START,
+            TITLE_SCENE_END                 : TITLE_SCENE_END,
+            MATCH_SCENE_START               : MATCH_SCENE_START,
+            MATCH_SCENE_END                 : MATCH_SCENE_END,
+            RESULT_SCENE_START              : RESULT_SCENE_START,
+            RESULT_SCENE_END                : RESULT_SCENE_END,
+            WIND_TILE_SHUFFLE_PHASE_START   : WIND_TILE_SHUFFLE_PHASE_START,
+            WIND_TILE_SHUFFLED              : WIND_TILE_SHUFFLED,
+            WIND_TILE_SHUFFLE_PHASE_END     : WIND_TILE_SHUFFLE_PHASE_END,
+            WIND_TILE_SELECTION_PHASE_START : WIND_TILE_SELECTION_PHASE_START,
+            WIND_TILE_SELECTION_PHASE_END   : WIND_TILE_SELECTION_PHASE_END,
+            WIND_TILE_SELECTION_VALID       : WIND_TILE_SELECTION_VALID,
+            WIND_TILE_RANDOM_CHOOSE         : WIND_TILE_RANDOM_CHOOSE,
+            WIND_TILE_SELECTION_INVALID     : WIND_TILE_SELECTION_INVALID,
+            WIND_TILE_SELECTION_NONE        : WIND_TILE_SELECTION_NONE
+        }
+
+        handled_message = event_messages.get(event_type, "未定義のログイベント")
+        
+        self._decorate_fixed_print(handled_message)
+        
+    FIXED_LINE = "─" * 8    # 固定8文字罫線（罫線は全角文字、幅2）
+    FIXED_SPACE = "　" * 8  # 固定8文字スペース（全角スペース、幅2）
+    # 左端+左スペースの幅（固定） 全角なので*2する
+    LEFT_WIDTH = len(FIXED_LINE) * 2 + len(FIXED_SPACE) * 2   #最初の罫線とスペース
+    RIGHT_WIDTH = len(FIXED_SPACE) * 2 + len(FIXED_LINE) * 2  # 最後のスペースと罫線
+    STRING_WIDTH = LEFT_WIDTH + RIGHT_WIDTH + 40              # 全体幅（ここに合わせて内容が調整される）
+
+    # 全角文字と半角文字を手動で区別して幅を計算
+    @staticmethod
+    def calculate_width(msg: str) -> int:
+        width = 0
+        for char in msg:
+            if len(char.encode('utf-8')) > 1:  # 2バイト以上なら全角
+                width += 2                     # 全角文字は幅2
+            else:  # 半角文字は1
+                width += 1
+        return width
+
+    def _decorate_fixed_print(self, handled_message: str):
+        # 中央部分の内容の幅を計算（全角と半角を考慮）
+        central_len = self.calculate_width(handled_message)
+
+        # 残りのスペースを計算（右側の可変スペース）
+        total_used_width = self.LEFT_WIDTH + central_len + self.RIGHT_WIDTH
+        right_padding = self.STRING_WIDTH - total_used_width
+        
+        # 全角スペースを挿入するので、「可変スペースの数」は整数除算で1/2にする
+        right_padding //= 2
+        
+        # 右側スペースがマイナスにならないように調整
+        if right_padding < 0:
+            right_padding = 0  # 長すぎる場合はそのまま
+        
+        right_paffing_spases = '　' * right_padding
+        
+        # 結果のデコレートした文字列
+        decorated = f"{self.FIXED_LINE}{self.FIXED_SPACE}{handled_message}{right_paffing_spases}{self.FIXED_SPACE}{self.FIXED_LINE}"
+        print(decorated)
+
+# -----------------------------------------------
+# ログイベントリスナーのセットアップ　event_typeでリスナーをサブスクライブする
+# -----------------------------------------------
+
+class LogEventListenerSetup:
+    """ログリスナーのセットアップクラス"""
+    def __init__(self, event_bus):
+        self.event_bus = event_bus
+        self.log_listener = LogEventListener()
+
+    def do(self):
+        """リスナーをイベントバスに登録"""
+        subscribe_target_types = [
+            FAIL_SAFE_MAX_LOOP_COUNT,
+            INPUT_AVAILABILITY,
+            NEXT_PHASE_NOT_FOUND_1,
+            NEXT_PHASE_NOT_FOUND_2,
+            GAME_START,
+            GAME_END,
+            TITLE_SCENE_START,
+            TITLE_SCENE_END,
+            MATCH_SCENE_START,
+            MATCH_SCENE_END,
+            RESULT_SCENE_START,
+            RESULT_SCENE_END,
+            WIND_TILE_SHUFFLE_PHASE_START,
+            WIND_TILE_SHUFFLED,
+            WIND_TILE_SHUFFLE_PHASE_END,
+            WIND_TILE_SELECTION_PHASE_START,
+            WIND_TILE_SELECTION_PHASE_END,
+            WIND_TILE_SELECTION_VALID,
+            WIND_TILE_SELECTION_INVALID,
+            WIND_TILE_RANDOM_CHOOSE,
+            WIND_TILE_SELECTION_NONE
+        ]
+
+        for target_type in subscribe_target_types:
+            self.event_bus.subscribe(target_type, self.log_listener.handle_log_by_event_type)
+
+# -----------------------------------------------
+# 状態遷移システム（State Machine）
+# -----------------------------------------------
+
+class State(ABC):
+    """State==Phaseの基底クラス"""
+    @abstractmethod
+    def enter(self):
+        pass
+
+    @abstractmethod
+    def exit(self):
+        pass
+
+    @abstractmethod
+    def update(self):
+        pass
+
+    @abstractmethod
+    def is_completed(self):
+        pass
+    
+    @abstractmethod
+    def reset(self):
+        pass
+
+# -----------------------------------------------
+# 状態遷移システム（State Machine）
+# -----------------------------------------------
+
+class StateMachine:
+    """状態遷移システム"""
+    def __init__(self, states, event_bus):
+        self.states = states
+        self.event_bus = event_bus
+        self.current_index = 0
+        self.current_state = None
+        self.is_finished = False
+        self.step_count = 0
+        self.max_steps = 20
+
+    def start(self):
+        if not self.states:
+            self.is_finished = True
+            return
+        self.current_state = self.states[0]
+        self.current_state.enter()
+
+    def update(self):
+        if self.watchdog(): return
+
+        if self.is_finished:
+            return
+        if self.current_state:
+            self.current_state.update()
+            if self.current_state.is_completed():
+                self.change_state()
+
+    def change_state(self):
+        if self.current_state.is_completed():
+            self.current_state.exit()
+            self.current_index += 1
+            if self.current_index >= len(self.states):
+                self.is_finished = True
+            else:
+                self.current_state = self.states[self.current_index]
+                self.current_state.enter()
+            
+    def reset(self):
+        self.current_index = 0
+        self.current_state = self.states[0] if self.states else None
+        self.is_finished = False
+        for state in self.states:
+            if hasattr(state, "reset"):
+                state.reset()
+
+    def watchdog(self):
+        self.step_count += 1
+        if self.step_count >= self.max_steps:
+            self.event_bus.publish(
+                SystemEvent(
+                    TIMEOUT_DETECTED,
+                    STATE_MACHINE_NOT_PROGRESSING
+                )
+            )
+            self.event_bus.publish(LogEvent(FAIL_SAFE_MAX_LOOP_COUNT))
+            self.is_finished = True
+            return True
+
+    def pause(self):
+        pass
+
+    def is_in_state(self):
+        pass
+
+# -----------------------------------------------
+# 風牌シャッフルフェーズ
+# -----------------------------------------------
+
+class WindTileShufflePhase(State):
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self.shuffle_done = False
+
+    def shuffle(self):
+        shuffler = "プレイヤー1"
+        self.shuffle_done = True
+        self.event_bus.publish(Event(WIND_TILE_SHUFFLED, shuffler=shuffler))
+        return shuffler
+
+    def enter(self):
+        Debug.print(self)
+        self.event_bus.publish(LogEvent(WIND_TILE_SHUFFLE_PHASE_START))
+        shuffler = self.shuffle()
+
+    def exit(self):
+        if not self.shuffle_done:
+            self.event_bus.publish(LogEvent(WIND_TILE_SHUFFLE_PHASE_END))
+
+    def update(self):
+        pass
+
+    def is_completed(self):
+        return self.shuffle_done
+
+    def reset(self):
+        self.shuffle_done = False
+
+# -----------------------------------------------
+# 風牌選択フェーズ
+# -----------------------------------------------
+
+class WindTileSelectionPhase(State):
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self.selection_done = False
+
+    def selection(self):
+        shuffled_event = self.event_history.get_event_by_type(WIND_TILE_SHUFFLED)
+        shuffler = shuffled_event[0].extra_data["shuffler"]
+        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_VALID, extra_data="風牌1"))
+        self.selection_done = True
+
+    def enter(self):
+        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_PHASE_START))
+        self.selection()
+
+    def exit(self):
+        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_PHASE_END))
+
+    def update(self):
+        pass
+
+    def is_completed(self):
+        return self.selection_done
+
+    def reset(self):
+        self.selection_done = False
+
+# -----------------------------------------------
+# フェーズ遷移の順序を定義する台本
+# -----------------------------------------------
+
+class PhaseTransitionOrder:
+    """フェーズ遷移の順序を列挙"""
+    phase_names = [
+        WindTileShufflePhase,
+        WindTileSelectionPhase
+    ]
+
+# -----------------------------------------------
+# シーン管理クラス（大きな遷移）
+# -----------------------------------------------
+
+class Scene(ABC):
+    """シーン管理クラス"""
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+
+    @abstractmethod
+    def on_enter(self):
+        pass
+
+    @abstractmethod
+    def on_exit(self):
+        pass
+
+    @abstractmethod
+    def update(self):
+        pass
+
+    @abstractmethod
+    def reset(self):
+        pass
+
+    @abstractmethod
+    def is_finished(self):
+        pass
+
+# -----------------------------------------------
+# タイトルメニュー画面シーン
+# -----------------------------------------------
+
+class TitleScene(Scene):
+    def __init__(self, event_bus, event_history):
+        super().__init__(event_bus, event_history)
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self._is_finished = False
+
+    def on_enter(self):
+        self.event_bus.publish(LogEvent(TITLE_SCENE_START))
+
+    def on_exit(self):
+        self.event_bus.publish(LogEvent(TITLE_SCENE_END))
+ 
+    def update(self):
+        self.mark_as_finished()
+
+    def reset(self):
+        self._is_finished = False
+
+    def is_finished(self):
+        return self._is_finished
+
+    def mark_as_finished(self):
+        if not self._is_finished:
+            self._is_finished = True
+            
+    def display_menu(self):  # メインメニューの表示
+        pass
+
+# -----------------------------------------------
+# 試合シーン
+# -----------------------------------------------
+
+class MatchScene(Scene):
+    def __init__(self, event_bus, event_history):
+        super().__init__(event_bus, event_history)
+        self.state_machine = StateMachine(
+            [
+                WindTileShufflePhase(event_bus, event_history),
+                WindTileSelectionPhase(event_bus, event_history)
+            ],
+            event_bus
+        )
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self._is_finished = False
+
+    def on_enter(self):
+        self.event_bus.publish(LogEvent(MATCH_SCENE_START))
+        self.start_match()
+
+    def on_exit(self):
+        self.event_bus.publish(LogEvent(MATCH_SCENE_END))
+
+    def update(self):
+        self.state_machine.update()
+        if self.state_machine.is_finished:
+            self.mark_as_finished()
+
+    def reset(self):
+        self.state_machine.reset()
+        self._is_finished = False
+
+    def is_finished(self):
+        return self._is_finished
+
+    def mark_as_finished(self):
+        if not self._is_finished:
+            self._is_finished = True
+            
+    def start_match(self):
+        self.state_machine.start()
+
+# -----------------------------------------------
+# 試合結果シーン
+# -----------------------------------------------
+
+class ResultScene(Scene):
+    def __init__(self, event_bus, event_history):
+        super().__init__(event_bus, event_history)
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self._is_finished = False
+
+    def on_enter(self):
+        self.event_bus.publish(LogEvent(RESULT_SCENE_START))
+        self.show_result()
+
+    def on_exit(self):
+        self.event_bus.publish(LogEvent(RESULT_SCENE_END))
+
+    def update(self):
+        self.mark_as_finished()
+
+    def reset(self):
+        self._is_finished = False
+
+    def is_finished(self):
+        return self._is_finished
+
+    def mark_as_finished(self):
+        if not self._is_finished:
+            self._is_finished = True
+
+    def show_result(self):
+        pass
+
+# -----------------------------------------------
+# シーンの条件分岐などあり得る順番を保持する
+# -----------------------------------------------
+
+class SceneFlow:
+    scene_names = [
+        TitleScene,
+        MatchScene,
+        ResultScene
+    ]
+
+# -----------------------------------------------
+# シーンを遷移させる
+# -----------------------------------------------
+
+class SceneTransitioner:
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.scene_order = SceneFlow.scene_names 
+        self.current_scene_index = 0
+        self.current_scene = self.scene_order[self.current_scene_index](event_bus, event_history)
+        self.all_scene_done = False
+        
+    def run(self):
+        """シーンの実行ループを開始"""
+        self.current_scene.on_enter()
+
+        MAX_LOOP = 10
+        loop_count = 0
+
+        while self.current_scene:
+            loop_count += 1
+            if loop_count >= MAX_LOOP:
+                self.event_bus.publish(LogEvent(FAIL_SAFE_MAX_LOOP_COUNT))
+                break        
+
+            self.current_scene.update()
+
+            if self.current_scene.is_finished():
+                self.transition_to_next_scene()
+
+            self.wait_seconds(0.01)
+
+    def transition_to_next_scene(self):
+        """次のシーンに遷移"""
+        self.current_scene.on_exit()
+        self.current_scene_index += 1
+
+        if self.current_scene_index >= len(self.scene_order):  # シーンの順番が終わったら終了
+            self.current_scene = None
+            self.all_scene_done = True
+        else:
+            self.current_scene = self.scene_order[self.current_scene_index](self.current_scene.event_bus, self.current_scene.event_history)
+            self.current_scene.on_enter()
+
+    def wait_seconds(self, second):
+        time.sleep(second)
+
+    def request_scene_change(self, next_scene):
+        """ユーザー操作で強制的に Scene を切り替える"""
+        if self.current_scene:
+            self.current_scene.on_exit()
+        self.current_scene = next_scene
+        self.current_scene.reset()
+        self.current_scene.on_enter()
+
+    def go_to_match_scene(self, restart=False):
+        match_scene = MatchScene(self.event_bus, self.event_history)
+        if restart:
+            match_scene.reset()  # PhaseもStateMachineも初期化
+        self.request_scene_change(match_scene)
+
+# -----------------------------------------------
+# ゲーム管理クラス
+# -----------------------------------------------
+
+class GameSession:
+    """ゲームの進行を管理するクラス"""
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self.scene_transitioner = None
+
+    def start_game(self):
+        """ゲームの開始処理"""
+        self.scene_transitioner = SceneTransitioner(self.event_bus, self.event_history)
+        self.event_bus.publish(LogEvent(GAME_START))
+        self.scene_transitioner.run()
+        self.end_game()
+
+    def end_game(self):
+        """ゲームの終了処理"""
+        self.event_bus.publish(LogEvent(GAME_END))
+        # if self.scene_transitioner:
+        #    self.scene_transitioner.request_scene_change(None)  # ゲーム終了時にシーン遷移を停止
+
+# -----------------------------------------------
+# ゲーム初期化クラス
+# -----------------------------------------------
+class GameLauncher:
+    def __init__(self):
+        self.event_history = EventHistory()
+        self.event_bus = EventBus(self.event_history)
+        self.log_listener_setup = LogEventListenerSetup(self.event_bus)
+        self.log_listener_setup.do()
+        self.game_session = GameSession(self.event_bus, self.event_history)
+
+    def launch(self):
+        Debug.print(self)
+        self.game_session.start_game()
+
+# -----------------------------------------------
+# 実行
+# -----------------------------------------------
+if __name__ == "__main__":
+    game_launcher = GameLauncher()  # ゲームの初期化
+    game_launcher.launch()
+    
