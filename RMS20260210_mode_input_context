@@ -1,0 +1,2090 @@
+# ■■■■ 変更点 ■■■■
+#     ・入力処理をプレイヤーとCPUで同じように扱える形に変更
+#         Commandはほぼ同じ処理でPlayerMode.InputProviderの具象が何かに依って挙動が変わる
+#     ・入力処理が可能かの判定クラスをもっと細かくした
+#         Unix/Linux系かWindows系かなどを判定するなど
+#     ・プレイヤーやプレイヤーモード周り変更したり修正したり
+#         PlayerMode.InputProviderが必ず対応する形をファクトリに制約する形で実装した
+#     ・即時発行イベント系をEventBusに追加（まだHistoryに対応させたりしていない）
+#         関連してEventHandlerにも即時発行系が出来たが、全てに即時発行版を作る訳では決してない
+#     ・試合設定をイベントとして取り回せる形に整理した（EventBus.EventHistory経由で）
+#         各フェイズが最新の試合設定をイベントから属性に転写して用い、フェイズ抜けの際等に再発行
+#     ・文字列を表示したいだけのイベントInfoEventとか対応Enumを整理したり
+#         序でにエラーイベント周り
+#     ・識別子を遅延評価する形にしたりした
+#         それでも尚出来るだけ前方参照とか意識してる並び順にしたい感じ。モジュール分けなぞ知らん
+#     ・仮東風牌クラスやレンダラーとかハンドラーとかをちゃんと対応させたりした
+#         このままだとレンダラーが超巨大になるよね……ハンドラーはクラス多すぎでわ？
+
+# ■■■■ 変更予定 ■■■■
+#     ・各種呼び出し側、処理層やドメイン層の旧いロジックや識別子を現行実装へ換装し実行可能にする
+#     ・各フェイズが最新の試合設定をイベントから属性に転写して用い、フェイズ抜けの際等に再発行する形へ
+#     ・MatchSceneに入る前に最初のイベントコンテキストを決定する処理を入れる
+#     ・エラーハンドリングが散発的に書いてるだけみたいな感じで正直管理していないのでそれもやる
+#     ・要するに全体のバグフィックスとリファクタリングが必要だし特に後半以下がかなり旧コード
+
+# ■■■■ 役割分担 ■■■■
+#     Visitor 判断・分岐　 本来は方法や処理を持つがそれはCommandのreceiverに委譲
+#     Command 命令実行     処理や方法を持つreceiverを保持しそれを実行する役目
+#     Phase   実行順の管理 その段階においてドメイン的に必要なVisitorを選ぶ
+#     Event   起きた事実   
+
+# ■■■■ 動作概要 ■■■■
+#     PhaseやEventHandlerなど、ドメイン処理をしたい場所においてVisitorを生成し、
+#     player.mode.accept_visitor(visitor)でコマンドを生成し実行する
+
+# ■■■■ 目次 ■■■■
+# 列挙体
+#     エラー用
+#     文言表示メッセージ用
+# 定数
+#     仮東風牌
+# デバッグ
+# 表示
+#     文字列装飾
+#     描画
+# イベント
+#     イベントの基底
+#     イベント履歴
+#     イベントバス
+#     イベントハンドラー
+#     各種イベントクラス
+# ネットワーク
+#     ネットワーククライアント
+# 入力
+#     入力提供担当
+#     入力可不可判定
+# コマンド
+#     コマンドの基底
+#     各種レシーバー
+#     各種コマンド
+#     各種ビジター
+# プレイヤー
+#     プレイヤーのモード（ユーザーかCPUかなど）
+#     プレイヤー
+# 状態機械
+#     ステートの基底
+#     ステートマシーン
+#     各種ステート（フェーズ）
+#     フェーズの順番
+# シーン
+#     シーンの基底
+#     各種シーン
+#     シーンの順番
+#     シーン遷移担当
+# ゲーム
+#     ゲームサブシステム纏めファケード
+#     ゲーム進行管理
+#     ゲーム初期化
+# メイン
+
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import random
+import socket
+import inspect
+from abc import ABC, abstractmethod
+from enum import Enum, auto
+from typing import Protocol
+from typing import List, Sequence, Mapping, Any, Optional
+from dataclasses import dataclass, field
+
+
+# -----------------------------------------------
+# エラークラスのハンドラーがイベント毎に表示したい文言
+# -----------------------------------------------
+
+class ErrorType(Enum):
+    RUNTIME = "実行時失敗。構文エラーではありませんが何かが間違っている様です"
+    LOGIC   = "論理的誤り。ロジックに誤りがあり期待通りに動作していない様です"
+    SYSTEM  = "機器問題。ハードウェアやデバイスレベルでの問題がある様です"
+
+class ErrorCodeType(Enum):
+    TIMEOUT_DETECTED              = "タイムアウト検出ですたい"
+    STATE_MACHINE_NOT_PROGRESSING = "StateMachine が進行しませんでしたね"
+    FAIL_SAFE_MAX_LOOP_COUNT      = "Fail-safe:無限ループ防止だぜ"
+    LOOP_LIMIT_EXCEEDED           = "ループ制限を上回りましたよん"
+    INPUT_UNAVAILABLE             = "ユーザーの入力が無効になっていますわね"
+    NEXT_PHASE_NOT_FOUND          = "次のフェーズはありませんわこれ"
+
+class SeverityType(Enum):
+    INFO    = "通知 ... 一般的な情報です。処理が正常に進んでいることを知らせるログです"
+    WARNING = "警告 ... 注意が必要な状態です。動作は続行できますが、問題の兆候があります"
+    ERROR   = "問題 ... 明確な問題が発生しました。処理の一部が失敗している状態です"
+    FATAL   = "致命 ... 致命的な問題が発生しました。アプリケーションの継続が困難な状態です"
+    
+
+# -----------------------------------------------
+# 描画クラスのハンドラーがイベント毎に表示したい文言
+# -----------------------------------------------
+
+class MsgTypeNs:
+    class GameType(Enum):
+        START = "ゲームを開始します"
+        END   = "ゲームを終了します"
+
+    class TitleSceneType(Enum):
+        START = "ここはそう、タイトルメニュー画面"
+        END   = "タイトルメニュー画面を終えますぞ"
+
+    class MatchSceneType(Enum):
+        START = "対局開始でっせ"
+        END   = "対局終了ですわ"
+
+    class ResultSceneType(Enum):
+        START = "試合結果ですよ"
+        END   = "試合結果さよなら"
+
+    class WindTileShufflePhaseType(Enum):
+        START         = "風牌シャッフルフェイズが開始されましたね"
+        SHUFFLE_START = "風牌がシャッフルされ始めましたぜ"
+        SHUFFLED      = "風牌はシャッフルされましたぜ"
+        END           = "風牌シャッフルフェイズが終了しましたよ"
+
+    class WindTileSelectionPhaseType(Enum):
+        START   = "風牌選択フェイズが開始されましたね"
+        END     = "風牌選択フェイズが終了しましたよ"
+        VALID   = "風牌が選ばれましたぜ"
+        INVALID = "選んだ風牌は無効でした。ランダムで選びますぜ"
+        RANDOM  = "風牌をランダムで選びましたぜ"
+        NONE    = "風牌が無くて選べませんぜ"
+
+
+# -----------------------------------------------
+# 仮東決め（席決め、場決め）にのみ使用する風牌
+# -----------------------------------------------
+
+class KaritonWindTiles:
+    def __init__(self):
+        self.__tiles__ = self._define_tiles()
+        self._prepare_randomized_tiles()
+        self._tiles_matrix = self._build_tiles_matrix()
+        self.tiles = self._tiles_matrix
+        self.meaning = self._define_meaning()
+        
+    def _define_tiles(self):
+        return [
+            ("🀀", "東"),  # 東
+            ("🀁", "南"),  # 南
+            ("🀂", "西"),  # 西
+            ("🀃", "北")   # 北
+        ]
+    
+    def _define_meaning(self):
+        return {
+            "🀀": "東",
+            "🀁": "南",
+            "🀂": "西",
+            "🀃": "北"
+        }
+    
+    ERROR_STRING = "呼び出し順序エラー: self.tilesを先に定義してください"
+    
+    def _check_tiles_initialized(self):
+        if self.__tiles__ is None:
+            raise RuntimeError(KaritonWindTiles.ERROR_STRING)
+    
+    def _prepare_randomized_tiles(self):
+        """場決めで誰かが風牌を混ぜる前に、自然にばらけた牌を再現、用意する"""
+        self._check_tiles_initialized()
+        random.shuffle(self.__tiles__)
+
+    def _build_tiles_matrix(self):
+        """2x2 のタイル行列を作成して返す"""
+        self._check_tiles_initialized()
+        return [self.__tiles__[:2], self.__tiles__[2:]]
+
+
+# -----------------------------------------------
+# デバッグ用
+# -----------------------------------------------
+
+# グローバルのデバッグフラグ
+DEBUG = False # True
+
+class Debug:
+    print_call_counter = 0
+    
+    @classmethod
+    def print(cls, obj, msg: str = None):
+        """オブジェクト obj のメソッドから呼ばれたときのデバッグ出力"""
+        if not DEBUG:
+            return
+
+        cls.print_call_counter += 1
+
+        # 呼び出し元のフレームを取得
+        frame = inspect.currentframe().f_back
+        lineno = frame.f_lineno
+        method_name = frame.f_code.co_name
+        class_name = obj.__class__.__name__ if obj else "Global"
+
+        print(
+            f"debug_print ...    | 行: {lineno} | 何処: {class_name:<18} の "
+            f"{method_name:<12} | {cls.print_call_counter}回目 | 補足 : {msg}"
+        )
+
+
+# -----------------------------------------------
+# 文字列を装飾する
+# -----------------------------------------------
+
+class StringDecotater():
+    FIXED_LINE = "─" * 8    # 固定8文字罫線（罫線は全角文字、幅2）
+    FIXED_SPACE = "　" * 8  # 固定8文字スペース（全角スペース、幅2）
+    LEFT_WIDTH = len(FIXED_LINE) * 2 + len(FIXED_SPACE) * 2   #最初の罫線とスペース len()は純粋な文字数なので全角2byte->*2する
+    RIGHT_WIDTH = len(FIXED_SPACE) * 2 + len(FIXED_LINE) * 2  # 最後のスペースと罫線
+    STRING_WIDTH = LEFT_WIDTH + RIGHT_WIDTH + 40              # 全体幅（ここに合わせて内容が調整される）
+
+    # 全角文字と半角文字を手動で区別して幅を計算
+    @staticmethod
+    def calculate_width(msg: str) -> int:
+        width = 0
+        for char in msg:
+            if len(char.encode('utf-8')) > 1:  # 2バイト以上なら全角
+                width += 2                     # 全角文字は幅2
+            else:  # 半角文字は1
+                width += 1
+        return width
+
+    @staticmethod
+    def _decorate_fixed_print(self, handled_message: str):
+        # 中央部分の内容の幅を計算（全角と半角を考慮）
+        central_len = self.calculate_width(handled_message)
+
+        # 残りのスペースを計算（右側の可変スペース）
+        total_used_width = self.LEFT_WIDTH + central_len + self.RIGHT_WIDTH
+        right_padding = self.STRING_WIDTH - total_used_width
+        
+        # 全角スペースを挿入するので、「可変スペースの数」は整数除算で1/2にする
+        right_padding //= 2
+        
+        # 右側スペースがマイナスにならないように調整
+        if right_padding < 0:
+            right_padding = 0  # 長すぎる場合はそのまま
+        
+        right_paffing_spases = '　' * right_padding
+        
+        # 結果のデコレートした文字列
+        decorated = (
+            f"{self.FIXED_LINE}{self.FIXED_SPACE}{handled_message}"
+            f"{right_paffing_spases}{self.FIXED_SPACE}{self.FIXED_LINE}"
+        )
+        print(decorated)
+
+
+# -----------------------------------------------
+# 描画クラス　CUI版 / GUI版 両方定義
+# -----------------------------------------------
+
+class Renderer(Protocol):
+    def show_message_event(self, event: MessageEvent): ...
+    def show_error_event(self, event: ErrorEvent): ...
+    def info_shuffler_operation(self, event): ...
+    def display_kariton_tiles(self, top_row: list, bottom_row: list): ...
+    def draw_timer(self, ms: int): ...
+
+
+class CuiRenderer:
+    def __init__(self):
+        self.is_tile_face_visible = True 
+
+    def info_shuffler_operation(self, event):
+        if event.player.mode is UserMode:  # 操作方法を2列3行で表示する
+            print(f"あなた がシャッフル担当です!! ")
+            actions = ShuffleActions.create()
+            lines = []
+            for i in range(0, len(actions), 2):
+                pair = actions[i:i+2]
+                line = " | ".join(
+                    f"{'/'.join(a.keys)}:{a.description}"
+                    for a in pair
+                )
+                # lines.append(" | ".join(f"{a.key}:{a.description}" for a in pair))
+                lines.append(line)
+            output = "\n".join(lines)
+            print(output)
+        elif event.player.mode is CpuMode:
+            print(f"{event.player.player_name} (CPU) がシャッフル中…… ")
+        elif event.player.mode is NetUserMode:
+            print(f"{event.player.player_name} (NET) がシャッフル中…")
+    
+    def display_kariton_tiles(self, kariton_tiles):  # top_row: list, bottom_row: list):
+        """ 牌の表示（内容がON/OFFで切り替え可能）"""
+        if self.show_content:
+            for row in kariton_tiles:
+                print(" ".join([tile[0] for tile in row]))  # tile[0] は絵文字部分
+            # print(f"{top_row[0]} {top_row[1]}")  # 旧引数の場合の旧実装
+            # print(f"{bottom_row[0]} {bottom_row[1]}")
+        else:
+            hidden_tile = "🀆"  # 表示のみ「裏牌」
+            print(f"{hidden_tile} {hidden_tile}")
+            print(f"{hidden_tile} {hidden_tile}")
+            
+    def draw_timer(self, ms: int):
+        print(f"残り時間: {ms}ms")
+            
+    def show_info_event(self, event: InfoEvent):
+        print(event)
+    
+    def show_error_event(self, event: ErrorEvent):
+        print(event)
+    
+
+# -----------------------------------------------
+# イベントクラスの基底クラス
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class Event():
+    pass
+
+
+# -----------------------------------------------
+# イベント履歴 
+# -----------------------------------------------
+
+class EventHistory:
+    def __init__(self):
+        self._events: list[Event] = []
+
+    def _add_event(self, event: Event):
+        self._events.append(event)
+
+    def get_events_by_instance(self, event: Event):
+        return [event for event in self.events if event.__class__.__name__]
+
+    def get_events_by_class(self, cls: type[Event]) -> list[Event]:
+        return [event for event in self._events if isinstance(event, cls)]
+
+    def get_last_event(self, cls: type[Event]) -> Event | None:
+        for event in reversed(self._events):
+            if isinstance(event, cls):
+                return event
+        return None
+
+
+# -----------------------------------------------
+# イベントバス 　サブスクライブと通知を行う
+#     ！：現状即時発行クラスをイベントヒストリーに追加していない
+# -----------------------------------------------
+
+class EventBus:
+    def __init__(self, event_history):
+        self.subscribers = []
+        self.immediate_subscribers = []
+        self.buffer = []
+        self.event_history = event_history
+
+    def subscribe(self, handler):
+        self._subscribers.append(handler)
+
+    def emit(self, event):
+        # self._publish_immediate(event)
+        self.buffer.append(event)
+
+    def flush(self):
+        for event in self.buffer:
+            self.__add_event_to_event_history__(event)
+            for subscribers in self.subscribers:
+                subscribers.handle(event)
+        self.buffer.clear()
+
+    def subscribe_immediate(self, handler):
+        self.immediate_subscribers.append(handler)
+
+    def publish_immediate(self, event):
+        for imm_sub in self.immediate_subscribers:
+            imm_sub.handle(event)
+
+    def __add_event_to_event_history__(self, event):
+        self.event_history._add_event(event)
+        
+    def get_events(self, cls: type[Event]) -> list[Event]:
+        return self.event_history.get_events_by_class(cls)
+
+    def get_last_event(self, cls: type[Event]) -> Event | None:
+        return self.event_history.get_last_event(cls)
+
+
+# -----------------------------------------------
+# イベントをハンドルするクラス関係（そのうちバッファ処理系のもの）
+# -----------------------------------------------
+
+class BaseEventHandler:
+    """ ハンドル処理のロジックだけを持つイベントハンドラーの基底クラス """
+    def handle(self, event: Event):  # ラッパー 外部がhandleを慣習的に使ってもOK
+        self.dispatch(event)
+    
+    def dispatch(self, event: Event):
+        method_name = f"on_{event.__class__.__name__}"
+        handler = getattr(self, method_name, self.default)
+        handler(event)
+
+    def default(self, event: Event):
+        raise NotImplementedError(
+            f"右に該当するハンドラーがありません {event.__class__.__name__}"
+        )
+
+
+class RendererEventHandler(BaseEventHandler):
+    """ 描画関係のハンドラーメソッドを持つハンドラークラス """
+    def __init__(self, renderer):
+        self.renderer = renderer
+    
+    def on_ShufflerDecidedEvent(self, event):
+        self.renderer.info_shuffler_operation(event)
+        
+    def on_DisplayKaritonTilesEvent(self, event):
+        self.renderer.display_kariton_tiles(event.top_row, event.bottom_row)
+        
+    def on_RemainingTimeEvent(self, event):
+        self.renderer.draw_timer(event.remaining_ms)
+        
+    def on_InfoEvent(self, event: InfoEvent):
+        self.renderer.show_info_event(event)
+    
+        
+        
+class ErrorEventHandler(BaseEventHandler):
+    """ エラー関係の為のハンドラークラス """
+    def __init__(self, renderer):
+        self.renderer = renderer
+    
+    def on_ErrorEvent(self, event):
+        self.renderer.show_error_event(event)
+
+
+class ReplayRendererEventHandler(BaseEventHandler):
+    """ リプレイ時と対局時での描画演出を分ける為のハンドラークラス """
+    pass
+
+
+class CompositeEventHandler(BaseEventHandler):
+    """
+    子 EventHandlerをaddで追加し保持し、全てのそれらにhandleで通知できる
+    ので、呼び出し側はこれだけをもっていればいい。
+    ただしビルダーで生成しましょうね
+    """
+    def __init__(self):
+        self.children: list[BaseEventHandler] = []
+
+    def add_handler(self, handler: BaseEventHandler):
+        """子 EventHandler を追加"""
+        self.children.append(handler)
+
+    def handle(self, event: 'Event'):
+        """全ての子にイベントを通知"""
+        for child in self.children:
+            child.handle(event)
+
+    def default(self, event: 'Event'):
+        """必要なら Composite 自体の default 処理も可能"""
+        # 基本は何もしない、または親クラスの default を呼ぶ
+        super().default(event)
+
+
+class EventHandlerBuilder:
+    """
+    CompositeEventHandler に子EventHandler を追加するための Builder クラス
+    Attributes:renderer: Renderer オブジェクト
+    """
+    def __init__(self, renderer):
+        self.renderer = renderer
+
+    def build(self) -> CompositeEventHandler:
+        root = CompositeEventHandler()
+        root.add_handler(RendererEventHandler(self.renderer))
+        return root
+
+
+# -----------------------------------------------
+# 即時通知系イベントハンドラー
+# -----------------------------------------------
+
+class TimerUiHandler(BaseEventHandler):
+    def __init__(self, renderer):
+        self.renderer = renderer
+
+    def on_PhaseTimerTickEvent(self, event):
+        self.renderer.show_timer(event.remaining_ms)
+
+
+class CompositeImmediateEventHandler(BaseEventHandler):
+    def __init__(self):
+        self.children: list[BaseEventHandler] = []
+
+    def add_handler(self, handler: BaseEventHandler):
+        self.children.append(handler)
+
+    def handle(self, event: 'Event'):
+        for child in self.children:
+            child.handle(event)
+
+    def default(self, event: 'Event'):
+        pass
+
+
+class ImmediateEventHandlerBuilder:
+    def __init__(self, renderer):
+        self.renderer = renderer
+
+    def build(self) -> CompositeImmediateEventHandler:
+        root = CompositeImmediateEventHandler()
+        root.add_handler(TimerUiHandler(self.renderer))
+        return root
+        
+
+# -----------------------------------------------
+# 全イベントハンドラーを一発で初期化してイベントバスにサブスクライブする
+# -----------------------------------------------
+class EventHandlerBootstrapper:
+    def __init__(self, renderer, event_bus):
+        self.composite_handler = EventHandlerBuilder(renderer).build()
+        self.event_bus.subscribe(composite_handler)
+        self.composite_imm_han = ImmediateEventHandlerBuilder(renderer).build()
+        self.event_bus.subscribe_immediate(composite_imm_han)
+
+
+# -----------------------------------------------
+# 個別のイベントクラス　フェイズ単位で起きた事とか
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class WindTileShuffledEvent(Event):
+    shuffled_tiles: Sequence[KaritonWindTiles]
+    shuffler: PlayerId
+
+
+@dataclass(frozen=True)
+class WindTileSelectedEvent(Event):
+    pass
+
+
+# -----------------------------------------------
+# 個別イベントクラス　フェイズ中で起きた事
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class ShufflerDecidedEvent(Event):
+    shuffle_player: Player
+
+
+@dataclass(frozen=True)
+class ShuffleInputEvent(Event):
+    key: str
+    timestamp: float
+
+
+@dataclass(frozen=True)
+class DisplayKaritonTilesEvent(Event):
+    top_row: tuple[int, int]
+    bottom_row: tuple[int, int]
+
+    
+@dataclass(frozen=True)
+class TileDiscardedEvent(Event):
+    player_id: int
+    tile: str
+
+
+#@dataclass(frozen=True)
+#class ShuffleOperationEvent(Event):
+#    shuffler: PlayerId
+#    operation: ShuffleOp  # ROTATE_CW, SWAP_ROWS など
+#    timestamp: float
+    
+
+# -----------------------------------------------
+# 入力行動イベント
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class KaritonShuffleAction:
+    keys: tuple[str, ...]
+    description: str
+    action: Callable
+
+
+class ShuffleActions:
+    @staticmethod
+    def create():
+        return [
+            KaritonShuffleAction(("LEFT",),  "反時計回り", lambda r: r.rotate_counter_clockwise()),
+            KaritonShuffleAction(("RIGHT",), "時計回り",   lambda r: r.rotate_clockwise()),
+            KaritonShuffleAction(("UP",),    "上下入替",   lambda r: r.swap_rows()),
+            KaritonShuffleAction(("DOWN",),  "左右入替",   lambda r: r.swap_cols()),
+            KaritonShuffleAction(("a",),     "斜め ↗↙",    lambda r: r.swap_anti_diagonal()),
+            KaritonShuffleAction(("d",),     "斜め ↘↖",    lambda r: r.swap_main_diagonal()),
+        ]
+
+
+# -----------------------------------------------
+# タイマー用イベント
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class RemainingTimeEvent(Event):
+    remaining_ms: int
+
+
+# -----------------------------------------------
+# 汎用ログ用のイベント
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class InfoEvent(Event):
+    type: Enum
+    param: Optional[Dict] = field(default_factory=dict)  # デフォルトは空 dict
+
+
+# -----------------------------------------------
+# 汎用エラー用のイベント
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class ErrorEvent(Event):
+    type: ErrorType
+    code: ErrorCodeType
+    details: Mapping[str, Any] | None
+    context: State | None
+    severity: SeverityType | None
+
+
+# -----------------------------------------------
+# プレイヤー関係のデータクラス
+# -----------------------------------------------
+
+@dataclass(frozen=True)
+class PlayerId:
+    value: int
+    
+    
+# -----------------------------------------------
+# ネットワーククライアント  現状モック
+#     消すかも
+# -----------------------------------------------
+
+# import asyncio
+# import websockets
+
+# 現状入力周りがイベント駆動でなくキー駆動なので不要
+#class NetworkClient:
+    # 全体的なネットワーク対応後に有効化する
+    # def __init__(self, uri):
+    #     self.uri = uri
+    # 
+    # async def _poll_network_event(self):
+    #     async with websockets.connect(self.uri) as websocket:
+    #         # サーバーから1イベント受信する
+    #         message = await websocket.recv()
+    #         # 受信したデータをイベントオブジェクトに変換
+    #         return self._parse_event(message)
+    # 
+    # def _parse_event(self, message):
+    #     # ここでは簡略化して文字列をイベントクラスに変換
+    #     if message == "wind_shuffled":
+    #         return WindTileShuffledEvent()
+    #     # 他のイベントも処理可能
+    #     return GenericEvent(message)
+    #     
+#    def receive_event(self, event_class=None, timeout=None):
+#        """
+#        ネットワークからイベントを受信して、条件に合うイベントが来るまで待つ。
+#        event_class: 受信したいイベントの種類（クラス）
+#        timeout: 待機の上限時間（秒）
+#        """
+#        start = time.time()
+#
+#        while True:
+#            event = self._poll_network_event()
+#
+#            if event_class is None or isinstance(event, event_class):
+#                return event
+#
+#            if timeout and (time.time() - start) > timeout:
+#                raise TimeoutError(f"{event_class.__name__} タイムアウト")
+#    
+#    def wait_for_shuffle_complete(self):
+#        self.receive_event(WindTileShuffledEvent)
+#
+#    # モック
+#    def _poll_network_event(self):
+#        time.sleep(0.1)
+#        return WindTileShuffledEvent()
+
+
+# -----------------------------------------------
+# 入力を提供する　GUI | CUI の他プレイヤーのMode別に定義
+# -----------------------------------------------
+
+class InputProvider(Protocol):
+    def get_key(self): ...
+
+
+class CuiUserInputProvider:
+    LEFT = "LEFT"
+    RIGHT = "RIGHT"
+    UP = "UP"
+    DOWN = "DOWN"
+    QUIT = "QUIT"
+
+    def get_key(self):
+        return input()  # 本物なら curses 等
+
+
+class CuiCpuInputProvider:
+    def __init__(self, key_source):
+        """
+        key_source: Iterator[str] や callable
+        """
+        self._key_source = key_source
+
+    def get_key(self) -> str:
+        time.sleep(0.05)
+        return next(self._key_source)
+
+        
+# class CpuInputProvider:
+#     KEYS = [
+#         "LEFT", "RIGHT", "UP", "DOWN", "a", "d"
+#     ]
+#     FINISH_KEYS = ["ENTER"]
+# 
+#     def __init__(self, steps: int):
+#         self.steps = steps
+#         self.count = 0
+# 
+#     def get_key(self):
+#         if self.count >= self.steps:
+#             return random.choice(self.FINISH_KEYS)
+#         self.count += 1
+#         time.sleep(0.05)  # 人間っぽさ
+#         return random.choice(self.KEYS)
+
+
+class CuiNetUserInputProvider:
+    def __init__(self, conn: socket.socket):
+        self.conn = conn
+
+    def get_key(self) -> str:
+        data = self.conn.recv(1024)  # bytes を受信
+        return data.decode("utf-8")
+
+
+class CuiReplayInputProvider(InputProvider):
+    def __init__(self, recorded_keys: list[str]):
+        self.keys = iter(recorded_keys)
+    
+    def get_key(self):
+        return next(self.keys)
+
+        
+# -----------------------------------------------
+# ユーザーの環境が入力が可能な環境か判定する
+# -----------------------------------------------
+
+class CuiAvailabilityDetector:
+    def is_available(self) -> bool:
+        """
+        CUI + リアルタイム入力が可能か
+        """
+        return self.is_tty() and self.supports_realtime_input()
+
+    def is_tty(self) -> bool:  # tty = teletype
+        try:
+            return sys.stdin.isatty()
+        except Exception:
+            return False
+
+    def get_platform(self) -> str:
+        """
+        'windows' | 'unix' | 'jython' | 'unknown'
+        """
+        if os.name == "nt":
+            return "windows"
+        elif os.name == "posix":
+            return "unix"
+        elif os.name == "java":
+            return "jython"
+        else:
+            return "unknown"
+
+    def supports_realtime_input(self) -> bool:
+        """
+        curses / msvcrt のどちらかが使えるか
+        """
+        if not self.is_tty():
+            return False
+
+        platform = self.get_platform()
+        if platform == "windows":
+            try:
+                import msvcrt
+                return True
+            except ImportError:
+                return False
+        elif platform == "unix":
+            try:
+                import curses
+                return True
+            except ImportError:
+                return False
+        return False
+
+
+# -----------------------------------------------
+# Cpuが「今の状態を見て、次に押すキー（行動）を決める」
+# -----------------------------------------------
+
+class DecisionMaker(Protocol):
+    def decide(self, context) -> str: ...
+        
+
+# -----------------------------------------------
+# CommandパターンのCommand基底クラス
+# -----------------------------------------------
+
+class Command(ABC):
+    @abstractmethod
+    def execute(self): ...
+
+
+# -----------------------------------------------
+# Commandパターンのレシーバー
+# -----------------------------------------------
+
+class WindTileShuffleReceiver:
+    """
+    Receiver 実際のドメイン的処理内容を保持する
+    風牌を2＊2で表示する事を前提に、左右列入れ替え、上下段入れ替え、
+    時計回り、反時計回り回りなどの混ぜ処理を定義する
+    若干隠し要素感のある処理として斜め同士の交換2パターンなどもある
+    """
+    def __init__(self, tiles):
+        self.tiles = tiles  # 4枚の風牌（2x2配置など）
+
+    def swap_rows(self):
+        self.tiles[0], self.tiles[1] = self.tiles[1], self.tiles[0]
+
+    def swap_cols(self):
+        self.tiles[0][0], self.tiles[0][1] = self.tiles[0][1], self.tiles[0][0]
+        self.tiles[1][0], self.tiles[1][1] = self.tiles[1][1], self.tiles[1][0]
+
+    def rotate_clockwise(self):
+        a, b = self.tiles[0]
+        c, d = self.tiles[1]
+        self.tiles = [[c, a], [d, b]]
+
+    def rotate_counter_clockwise(self):
+        a, b = self.tiles[0]
+        c, d = self.tiles[1]
+        self.tiles = [[b, d], [a, c]]
+
+    # ↘↖（左上 ↔ 右下）
+    def swap_main_diagonal(self):  # def swap_top_left_and_bottom_right(self):
+        self.tiles[0][0], self.tiles[1][1] = self.tiles[1][1], self.tiles[0][0]
+
+    # ↗↙（右上 ↔ 左下）
+    def swap_anti_diagonal(self): # def swap_top_right_and_bottom_left(self):
+        self.tiles[0][1], self.tiles[1][0] = self.tiles[1][0], self.tiles[0][1]
+        
+
+# -----------------------------------------------
+# Commandパターンの各種コマンドクラス群
+# -----------------------------------------------
+
+class BaseShuffleCommand(Command):
+    "ユーザーもCPUも同じコマンドを使う。違いはinput_providerの具像クラス次第"
+    def __init__(self, receiver, event_bus, input_provider):
+        self.receiver = receiver
+        self.event_bus = event_bus
+        self.input = input_provider
+        self.actions = ShuffleActions.create()
+        self.action_map = {
+            key: action
+            for action in self.actions
+            for key in action.keys
+        }
+        self._prepare_input_if_needed()
+
+    def execute(self):
+        while True:
+            key = self.input.get_key()
+            self._publish_event(key)
+
+            if key in ("ENTER", "q", "z", "x"):
+                break
+
+            action = self.action_map.get(key)
+            if action:
+                action.apply(self.receiver)
+
+    def _publish_event(self, key):
+        self.event_bus.publish_immediate(
+            DisplayKaritonTilesEvent(self.receiver.tiles)
+        )
+        self.event_bus.publish_immediate(
+            ShuffleInputEvent(
+                key=key,
+                timestamp=time.monotonic()
+            )
+        )
+        
+    def _prepare_input_if_needed(self):
+        ...
+
+
+class UserShuffleCommand(BaseShuffleCommand):
+    pass
+
+
+# 過去の実装　ユーザーとCPUなどで処理の殆どを共通化する前、アクションを定義する前の実装
+#class UserShuffleCommand(Command):
+#    """
+#    ユーザーが入力を使ってシャッフルするコマンド
+#    左を押すと反時計回りに
+#    右を押すと時計回りに
+#    上を押すと上下段を入れ替え
+#    下を押すと左右列を入れ替える
+#    """
+#    def __init__(self, shuffle_receiver, event_bus, input_provider):
+#        self.shuffle_receiver = shuffle_receiver
+#        self.event_bus = event_bus
+#        self.input = input_provider
+#        self.actions = ShuffleActions.create()
+#        self.action_map = {
+#            key: action
+#            for action in self.actions
+#            for key in action.keys
+#        }
+#
+#    def execute(self):
+#        while True:
+#            key = self.input.get_key()
+#            self._publish_event()
+#            if key in ("ENTER", "q", "z", "x"):
+#                break
+#            action = self.action_map.get(key)
+#            if action:
+#                action.apply(self.shuffle_receiver)
+#
+#    def _publish_event(self, key):
+#        self.event_bus.emit(
+#            ShuffleInputEvent(
+#                key=key,
+#                timestamp=time.monotonic()
+#            )
+#        )
+#
+    # def execute(self):
+    #     while True:
+    #         key = self.input.get_key()
+    # 
+    #         if key == "LEFT":
+    #             self.shuffle_receiver.rotate_counter_clockwise()
+    #         elif key == "RIGHT":
+    #             self.shuffle_receiver.rotate_clockwise()
+    #         elif key == "UP":
+    #             self.shuffle_receiver.swap_rows()
+    #         elif key == "DOWN":
+    #             self.shuffle_receiver.swap_cols()
+    #         elif key == "d":
+    #             self.shuffle_receiver.swap_main_diagonal()
+    #         elif key == "a":
+    #             self.shuffle_receiver.swap_anti_diagonal()
+    #         elif key in ("ENTER", "q", "z", "x"):
+    #             break
+
+
+class CpuShuffleCommand(BaseShuffleCommand):
+    def _prepare_input_if_needed(self):
+        self.input.set_key_source(self._yield_cpu_key_source())
+
+    def _yield_cpu_key_source(self):
+        while True:
+            yield random.choice(["LEFT", "RIGHT", "UP", "DOWN", "a", "d", "ENTER"])
+
+
+# 過去の実装　CPUがプレイヤーと同じ様な入力をせず、直接レシーバーとかアクションを呼ぶ感じ
+#class CpuShuffleCommand(Command):
+#    """
+#    CPUがシャッフルする場合のコマンド
+#    風牌シャッフルの制限時間を5秒として5秒間に人間がガチャ押しでできる最大手数を考える
+#    ざっくり現実的な目安：
+#    片手でキー押しする場合、人間は 1秒に約5〜6回 が限界（高速タップ）
+#    両手使うなら 1秒に10〜15回 程度
+#    5秒なら 50〜75回程度 と考えれば十分
+#    CPU の手数設定に反映させるなら、50手〜100手程度 にすれば自然な混ぜ強さか
+#    とは言えプレイヤーの中には一回も混ぜない人も居るだろうなぁ
+#    なので0, 101にしたけど、この0がもし何か不都合を生むのであれば1にする（多分大丈夫）
+#    """
+#    def __init__(self, shuffle_receiver, event_bus, steps = random.randint(0, 101)):
+#        self.shuffle_receiver = shuffle_receiver
+#        self.event_bus = event_bus
+#        self.steps = steps
+#        self.actions = ShuffleActions.create()
+#
+# ver2
+#    def execute(self):
+#        for _ in range(self.steps):
+#            action = random.choice(self.actions)
+#            action.apply(self.receiver)
+#            time.sleep(0.05)
+#    
+    #ver1    
+    #     self.action_map = list(action_map.values())
+    #    
+    # def execute(self):
+    #     for _ in range(self.steps):
+    #         action = random.choice(self.action_map)
+    #         action.action(self.shuffle_receiver)
+    #         time.sleep(0.05)  # 人間っぽさ
+#    
+    #ver0
+    # def execute(self):
+    #     ops = [
+    #         self.shuffle_receiver.swap_rows,
+    #         self.shuffle_receiver.swap_cols,
+    #         self.shuffle_receiver.rotate_clockwise,
+    #         self.shuffle_receiver.rotate_counter_clockwise
+    #     ]
+    #     for _ in range(self.steps):
+    #         random.choice(ops)()
+
+
+class NetUserShuffleCommand(Command):
+    """ネットワークの他ユーザーがシャッフルする場合のコマンド"""
+    pass
+    # 過去の実装　キー入力を待つのではなくイベントを待つネットワーククライアントを使う形式だった
+    # def __init__(self, event_bus, network_client):
+    #     self.client = network_client
+    #     self.event_bus = event_bus
+
+    # def execute(self):
+    #     self.client.wait_for_shuffle_complete()
+
+
+class ReplayShuffleCommand(Command):
+    pass
+
+
+# -----------------------------------------------
+# コマンドビジター　コマンド（処理、方法）を持つ訪問者
+# -----------------------------------------------
+
+class ShuffleCommandVisitor:
+    def __init__(self, shuffle_receiver, event_bus):
+        self.shuffle_receiver = shuffle_receiver
+        self.event_bus = event_bus
+
+    def visit_user(self, mode):
+        return UserShuffleCommand(self.shuffle_receiver, self.event_bus, mode.input)
+
+    def visit_cpu(self, mode):
+        return CpuShuffleCommand(self.shuffle_receiver, self.event_bus, mode.input)
+        
+    def visit_net_user(self, mode):
+        return NetUserShuffleCommand(self.event_bus, self.event_bus, mode.input)
+        
+    def visit_replay_user(self, mode):
+        pass
+        # return ReplayShuffleCommand(self.event_bus, self.event_bus, mode.input)
+
+
+# -----------------------------------------------
+# プレイヤーのモード（自分/CPU/他人）に依って対応コマンドを生成するクラス群
+# -----------------------------------------------
+
+class BasePlayerMode:
+    """プレイヤーのモードの基底クラス"""
+    def create_shuffle_command(self, shuffler):
+        raise NotImplementedError
+
+
+class UserMode(BasePlayerMode):
+    """ユーザー自身がプレイする場合のモード"""
+    def __init__(self, input_provider):
+        self.input = input_provider
+        
+    def accept_visitor(self, visitor):
+        return visitor.visit_user(self)
+
+
+class CpuMode(BasePlayerMode):
+    """コンピュータープレイヤーのモード"""
+    def __init__(self, input_provider):
+        self.input = input_provider
+
+    def accept_visitor(self, visitor):
+        return visitor.visit_cpu(self)
+    
+
+class NetUserMode(BasePlayerMode):
+    """ネット上の他人のプレイヤーモード"""
+# 過去の実装　イベントを待つネットワーククライアントを使う場合のもの
+#    def __init__(self, client):
+#        self.client = client
+    def __init__(self, input_provider):
+        self.input = input_provider
+
+    def accept_visitor(self, visitor):
+        return visitor.visit_net_user(self)
+
+
+class ReplayMode(BasePlayerMode):
+    """リプレイ時のモード"""
+    def __init__(self, input_provider):
+        self.input = input_provider
+
+    def accept_visitor(self, visitor):
+        pass
+        # return visitor.visit_replay_user(self)
+    
+
+# -----------------------------------------------
+# プレイヤー　使用前に必ず Mode を持たせ Mode は InputProvider を持つ事
+# -----------------------------------------------
+
+class Player:
+    def __init__(self, mode: PlayerMode):
+        self._mode = mode
+
+    @property
+    def input_provider(self) -> InputProvider:
+        return self._mode.input_provider
+
+    def set_mode(self, mode: PlayerMode):
+        self._mode = mode
+
+
+# ver1
+# class Player:
+#     def __init__(self, controller: PlayerController, seat: Seat):
+#         self._controller = controller
+#         self.seat = seat
+# 
+#     def get_input(self, game_state):
+#         return self._controller.get_input(game_state)
+# 
+#     def change_controller(self, controller: PlayerController):
+#         self._controller = controller
+
+
+# ver0
+# class Player:
+#     def __init__(self, mode: PlayerMode, id: PlayerId, name: str):
+#         self.mode: PlayerMode = mode
+#         self.player_id: PlayerId = id
+#         self.player_name: str
+        # self.hand_tiles: HandTiles
+        # self.score: int
+
+
+# -----------------------------------------------
+# 対局設定とプレイヤーの生成 
+# -----------------------------------------------
+
+class MatchType(Enum):
+    LOCAL = auto()     # ローカル対戦
+    NETWORK = auto()   # ネット対戦
+    SPECTATE = auto()  # 観戦
+    REPLAY = auto()    # リプレイ
+
+
+class PlayerRole(Enum):
+    USER = auto()
+    CPU = auto()
+    NET_USER = auto()
+    CPU_USER = auto()
+
+
+@dataclass(frozen=True)
+class PlayerConfig:
+    id: PlayerId
+    role: PlayerRole
+
+
+@dataclass(frozen=True)
+class MatchConfig:
+    player_configs: List[PlayerConfig]
+    match_type: MatchType
+    rule_config: RuleConfig
+
+
+class PlayerFactory:
+    def __init__(self, mode_factory: ModeFactory):
+        self.mode_factory = mode_factory
+
+    def create_player(self, config: PlayerConfig) -> Player:
+        mode = self.mode_factory.create(config.role)
+        return Player(mode)
+
+
+class ModeFactory:
+    def create(self, role: PlayerRole) -> PlayerMode:
+        if role == PlayerRole.USER:
+            mode = UserMode()
+            mode.input_provider = UserInputProvider()
+        elif role == PlayerRole.CPU:
+            mode = CpuMode()
+            mode.input_provider = CpuInputProvider()
+        elif role == PlayerRole.NET_USER:
+            mode = NetUserMode()
+            mode.input_provider = NetInputProvider()
+        elif role == PlayerRole.CPU_USER:
+            mode = CpuUserMode()
+            mode.input_provider = CpuInputProvider()
+        else:
+            raise ValueError(role)
+        return mode
+
+
+class PlayerControlSwitcher:
+    def __init__(self, mode_factory: ModeFactory):
+        self._mode_factory = mode_factory
+
+    def switch(self, player: Player, role: PlayerRole):
+        new_mode = self._mode_factory.create(role)
+        player.set_mode(new_mode)
+
+
+class PlayerModeSwitchEventHandler:
+    def __init__(self, switcher: PlayerControlSwitcher):
+        self.switcher = switcher
+
+    def on_UserDisconnectEvent(self, event):
+        self.switcher.switch(event.player, PlayerRole.CPU_USER)
+
+    def on_UserReconnectEvent(self, event):
+        self.switcher.switch(event.player, PlayerRole.USER)
+
+    def on_NetUserLostEvent(self, event):
+        self.switcher.switch(event.player, PlayerRole.CPU)
+
+
+class MatchContext:
+    def __init__(self, match_config: MatchConfig, mode_factory: ModeFactory, player_factory: PlayerFactory):
+        self.match_config = match_config
+        self.player_factory = player_factory
+        self.state_machine = StateMachine(self)  # StateMachine との連携
+        self.players = [self.player_factory.create_player(config) for config in match_config.player_configs]
+        self.match_type = match_config.match_type
+        self.rule_config = match_config.rule_config
+
+    def start(self):
+        # ここで対局開始前に必要な処理を実行
+        print(f"Starting match of type {self.match_type}")
+        self.state_machine.start()
+
+    def end(self):
+        # 対局終了時の処理
+        print("Match ended!")
+        self.state_machine.end()
+
+
+class MatchContextUpdatedEvent:
+    def __init__(self, match_context: MatchContext):
+        self.match_context = match_context
+        
+        
+# 各 Phase は EventBus.EventHistory.MatchContextUpdatedEvent.MatchContext を
+# 属性に転写して Phase 内での参照や変更に使い、Phaseを抜ける際に新たな
+# MatchContextUpdatedEvent を発行すればいいかなとおもうきもち
+
+
+################ ver4 そもそもモードにハードコーディングする場合
+# 
+# class PlayerMode:
+#     def __init__(self, input_provider: InputProvider):
+#         self.input_provider = input_provider
+# 
+# 
+# class UserMode(PlayerMode):
+#     def __init__(self):
+#         super().__init__(UserInputProvider())
+# 
+# 
+# class CpuMode(PlayerMode):
+#     def __init__(self):
+#         super().__init__(CpuInputProvider())
+# 
+# 
+# class NetUserMode(PlayerMode):
+#     def __init__(self):
+#         super().__init__(NetInputProvider())
+# 
+# 
+# class CpuUserMode(PlayerMode):
+#     def __init__(self):
+#         super().__init__(CpuInputProvider())
+# 
+#
+################
+
+################ ver3
+# 
+# class PlayerFactory:
+#     def create(self, config: PlayerConfig) -> Player:
+#         mode = self._create_mode(config.role)
+#         input_provider = self._create_input_provider(config.role)
+#         return Player(mode, input_provider)
+#     
+#     def _create_mode(self, role: PlayerRole) -> PlayerMode:
+#         match role:
+#             case PlayerRole.USER: return UserMode()
+#             case PlayerRole.CPU: return CpuMode()
+#             case PlayerRole.NET_USER: return NetUserMode()
+#             case PlayerRole.CPU_USER: return CpuUserMode()
+#             case _: raise ValueError(role)
+#     
+#     def _create_input_provider(self, role: PlayerRole) -> InputProvider:
+#         match role:
+#             case PlayerRole.USER: return UserInput()
+#             case PlayerRole.CPU: return CpuInput()
+#             case PlayerRole.NET_USER: return NetInput()
+#             case PlayerRole.CPU_USER: return CpuInput()
+#             case _: raise ValueError(role)
+# 
+# 
+# class PlayerControlSwitcher:
+#     def switch(self, player: Player, new_mode: PlayerMode, new_input: InputProvider):
+#         player.set_control(new_mode, new_input)
+# 
+# 
+# class PlayerModeSwitchEventHandler:
+#     def __init__(self, switcher: PlayerControlSwitcher):
+#         self.switcher = switcher
+# 
+#     def on_UserDisconnectEvent(self, event):
+#         self.switcher.switch(event.player, PlayerRole.CPU_USER)
+# 
+#     def on_UserReconnectEvent(self, event):
+#         self.switcher.switch(event.player, PlayerRole.USER)
+# 
+#     def on_NetUserLostEvent(self, event):
+#         self.switcher.switch(event.player, PlayerRole.CPU)
+# 
+# 
+# #マッチシーンはこう書けるかなという例
+# class MatchScene(Scene):
+#     def __init__(self, config: MatchConfig):
+#         factory = PlayerFactory()
+#         players = [factory.create(pc) for pc in config.player_configs]
+#         self.match = Match(players, PlayerControlSwitcher(factory))
+# 
+# 
+################
+
+################ ver2
+#
+# class PlayerFactory:
+#     def create(self, config: PlayerConfig) -> "Player":
+#         mode = self._create_mode(config.role)
+#         input_provider = self._create_input_provider(config.role)
+#         return Player(mode, input_provider)
+#         
+#     def _create_mode(self, role: PlayerRole) -> "PlayerMode":
+#         if role == PlayerRole.USER:
+#             return UserMode()
+#         if role == PlayerRole.CPU:
+#             return CpuMode()
+#         if role == PlayerRole.NET_USER:
+#             return NetUserMode()
+#         if role == PlayerRole.CPU_USER:
+#             return CpuUserMode()
+#         raise ValueError(role)
+# 
+#     def _create_input_provider(self, role: PlayerRole) -> "InputProvider":
+#         if role == PlayerRole.USER:
+#             return UserInput()
+#         if role == PlayerRole.CPU:
+#             return CpuInput()
+#         if role == PlayerRole.NET_USER:
+#             return NetInput()
+#         if role == PlayerRole.CPU_USER:
+#             return CpuInput()
+#         raise ValueError(role)
+#
+#
+################
+
+################ ver1
+#
+# class Player:
+#     def __init__(self, player_id: int, player_name: str, mode: 'PlayerMode'):
+#         self.player_id = player_id
+#         self.player_name = player_name
+#         self.mode = mode
+# 
+#     def set_name(self, name: str):
+#         self.player_name = name
+# 
+# class PlayerInitializer:
+#     def __init__(self, player_count: int):
+#         self.player_count = player_count
+# 
+#     def initialize_players(self, settings):
+#         players = []
+#         for player_id in range(self.player_count):
+#             player_name = self.determine_player_name(player_id, settings)
+#             mode = self._select_mode(player_id, settings)
+#             player = Player(player_id, player_name, mode)
+#             players.append(player)
+#         return players
+# 
+#     def determine_player_name(self, player_id: int, settings) -> str:
+#         """プレイヤー名の決定処理。ユーザーが指定するか、CPUの場合は自動生成"""
+#         if settings[player_id]['mode'] == 'CPU':
+#             # CPUなら名前生成処理を呼ぶ
+#             return self.generate_cpu_name(player_id)
+#         elif settings[player_id]['mode'] in ['User', 'NetUser']:
+#             # ユーザー入力またはネットユーザーなら設定で指定された名前
+#             return settings[player_id]['name']
+#         else:
+#             return f"Unknown Player {player_id}"
+# 
+#     def generate_cpu_name(self, player_id: int) -> str:
+#         """CPUの場合の名前生成"""
+#         return f"CPU-{player_id}"
+# 
+#     def _select_mode(self, player_id: int, settings) -> PlayerMode:
+#         """プレイヤーIDに応じたモードを選択"""
+#         mode_type = settings[player_id]['mode']
+#         if mode_type == 'User':
+#             return PlayerMode(UserInputProvider())
+#         elif mode_type == 'NetUser':
+#             return PlayerMode(NetInputProvider())
+#         else:
+#             return PlayerMode(CpuInputProvider())
+#
+#
+################
+
+################ ver0
+#
+# class PlayerInitializer:
+#     def __init__(self, player_count: int):
+#         self.player_count = player_count
+# 
+#     def initialize_players(self):
+#         players = []
+#         for player_id in range(self.player_count):
+#             mode = self._select_mode(player_id)
+#             self._set_name()
+#             player = Player(player_id, player_name, mode)
+#             players.append(player)
+#         return players
+# 
+#     # モック  Mode が User / NetUser なら設定値を。Cpuならば名前生成処理を呼ぶか
+#     def _set_name(self)
+#         """単純にプレイヤー に プレイヤーID + 1 をくっつける（Player 1|2|3|4）"""
+#         player_name = f"Player {player_id + 1}"
+# 
+#     # モック　実際にはプレイヤーが何 mode かはマッチングや対局設定に依る
+#     def _select_mode(self, player_id: int) -> PlayerMode:
+#         """プレイヤーID に応じたモードを選択"""
+#         if player_id == 0:
+#             # プレイヤー0はユーザー入力
+#             return PlayerMode(UserInputProvider())
+#         elif player_id == 1:
+#             # プレイヤー1はCPU
+#             return PlayerMode(CpuInputProvider())
+#         else:
+#             # プレイヤー2, 3はネット入力
+#             return PlayerMode(NetInputProvider())
+# 
+# 
+#     下記コードを対局開始前準備に置く
+#     ゲーム開始前のプレイヤー初期化
+#     initializer = PlayerInitializer(player_count=4)
+#     players = initializer.initialize_players()
+#
+#
+################
+
+
+# -----------------------------------------------
+# 減っていくタイマー
+# -----------------------------------------------
+
+class CountdownTimer:
+    def __init__(self, limit_sec: float):
+        self.limit_sec = limit_sec
+        self.start_time = None
+
+    def start(self):
+        self.start_time = time.monotonic()
+
+    def remaining_ms(self) -> int:
+        elapsed = time.monotonic() - self.start_time
+        return max(0, int((self.limit_sec - elapsed) * 1000))
+
+
+# -----------------------------------------------
+# 状態遷移システム（State Machine）
+# -----------------------------------------------
+
+class State(ABC):
+    """State==Phaseの基底クラス"""
+    @abstractmethod
+    def enter(self): ...
+    @abstractmethod
+    def exit(self): ...
+    @abstractmethod
+    def update(self): ...
+    @abstractmethod
+    def reset(self): ...
+    @abstractmethod
+    def is_completed(self): ...
+    
+
+# -----------------------------------------------
+# 状態遷移システム（State Machine）
+#     なぁんかパッと見こう、複雑というか責務が重そうに見えるんだよなぁ
+# -----------------------------------------------
+
+class StateMachine:
+    """状態遷移システム"""
+    def __init__(self, states, event_bus):
+        self.states = states
+        self.event_bus = event_bus
+        self.current_index = 0
+        self.current_state = None
+        self.is_finished = False
+        self.step_count = 0
+        self.max_steps = 100
+
+    def start(self):
+        if not self.states:
+            self.is_finished = True
+            return
+        self.current_state = self.states[0]
+        self.current_state.enter()
+
+    def update(self):
+        if self.watchdog():  # ループ回数制限に達していないかどうか
+            return
+        if self.is_finished:  # StateMachineが終わってるかどうか
+            return
+        if self.current_state:  # 現在のStateの更新を呼び、終わってたらState変更
+            self.current_state.update()
+            if self.current_state.is_completed():
+                self.change_state()
+
+    def change_state(self):
+        if self.current_state.is_completed():  # 外部呼び出し等に対する安全策
+            self.current_state.exit()  # 現在のStateを抜けてindexを進める
+            self.current_index += 1  # indexが全State数以上なら終了フラグを立てる
+            if self.current_index >= len(self.states):  
+                self.is_finished = True
+            else:  # そうでなければ次のStateをindexを使って得て、そのStateに入る
+                self.current_state = self.states[self.current_index]
+                self.current_state.enter()
+            
+    def reset(self):
+        self.current_index = 0
+        self.current_state = self.states[0] if self.states else None
+        self.is_finished = False
+        for state in self.states:
+            if hasattr(state, "reset"):
+                state.reset()
+
+    def watchdog(self):
+        self.step_count += 1
+        if self.step_count >= self.max_steps:
+            self.event_bus.publish(
+                ErrorEvent(
+                    ErrorType.RUNTIME,
+                    ErrorCodeType.FAIL_SAFE_MAX_LOOP_COUNT,
+                    {f"{self.step_count} >= {self.max_steps}"},
+                    self.current_state,
+                    SeverityType.ERROR
+                )
+            )
+            self.is_finished = True
+            return True
+
+    def pause(self):
+        pass
+
+    def is_in_state(self):
+        pass
+
+
+# -----------------------------------------------
+# 風牌シャッフルフェーズ
+# -----------------------------------------------
+
+class WindTileShufflePhase(State):
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self.tiles = KaritonWindTiles().tiles
+        self.shuffle_done = False
+
+    def enter(self):
+        self.event_bus.emit(InfoEvent(MsgTypeNs.WindTileShufflePhaseType.START))
+        self.execute()
+
+    def exit(self):
+        if self.shuffle_done:
+            self.event_bus.emit(InfoEvent(MsgTypeNs.WindTileShufflePhaseType.END))
+
+    def update(self):
+        self.event_bus.publish_immediate(
+            RemainingTimeEvent(self.remaining_ms())
+        )
+
+    def reset(self):
+        self.shuffle_done = False
+
+    def is_completed(self):
+        return self.shuffle_done
+
+    def _select_shuffler(self):
+        shuffler = random.choice(self.players)
+        self.event_bus.publish_immediate(ShufflerDecidedEvent(shuffler))
+        return shuffler
+
+    def _get_visitor(self):
+        return ShuffleCommandVisitor(
+            WindTileShuffleReceiver(self.tiles),
+            event_bus
+        )
+
+    def _get_command(self, shuffler, visitor):
+        return shuffler.mode.accept_visitor(visitor)
+    
+    def _record_start_time(self):
+        LIMIT_SEC = 4
+        self.timer = CountdownTimer(LIMIT_SEC)
+        self.timer.start()
+
+    def execute(self):
+        shuffler = self._select_shuffler()
+        visitor = self._get_visitor()
+        command = self._get_command(shuffler, visitor)
+        self._record_start_time()()
+        command.execute()
+        
+
+# かつてここだけをゲームとして実行可能かテストしてた時の産物を利用する為のコピペであって用が済んだら消される存在だぜベイベ
+# かつてどういう実装でやったのか一々探してくるの面倒なのでここに暫くおいてあるけど多分もうまもなく消されるぜベイベ
+class WindTileShuffleGame:
+    def __init__(self, event_history, is_player_shuffling=True, show_content=True):
+        self.event_history = event_history  # イベントヒストリーを依存性注入
+        self.is_player_shuffling = is_player_shuffling  # プレイヤーが混ぜるか
+        self.show_content = show_content  # 内容表示のフラグ
+
+    def shuffle_for_cpu(self, shuffler):
+        """CPUによるシャッフル処理"""
+        print(f"{shuffler}が混ぜました。ランダムシャッフルを実行します...")
+        top_row, bottom_row = self.initialize_tiles()
+        self.display_tiles(top_row, bottom_row)
+
+        # シャッフルイベントを記録
+        event = ShuffleCompletedEvent((top_row, bottom_row), shuffler)
+        self.event_history.add_event(event)
+
+    def shuffle_for_player(self, shuffler):
+        """プレイヤーによるシャッフル処理"""
+        print(f"{shuffler}が混ぜます。\n")
+        top_row, bottom_row = self.initialize_tiles()
+        self.display_tiles(top_row, bottom_row)
+
+        # シャッフルイベントを記録
+        event = ShuffleCompletedEvent((top_row, bottom_row), shuffler)
+        self.event_history.add_event(event)
+
+        print("\n操作方法: 'q' で終了")
+        user_input = self.get_input("次に操作したい内容を入力してください（終了は 'q'）：")
+        if user_input and user_input.lower() == 'q':
+            print("シャッフル終了。プログラムを終了します。")
+        else:
+            print(f"無効な入力: {user_input}")
+            print("シャッフル終了。プログラムを終了します。")
+
+    def wait_for_network_player_shuffling(self):
+        """ネットワークプレイヤーが混ぜるのを待つ処理"""
+        print("ネットワークプレイヤーが混ぜるのを待っています...")
+        time.sleep(3)  # ダミー待機
+        print("ネットワークプレイヤーのシャッフルが完了しました。\n")
+
+    def handle_shuffle(self, shuffler):
+        """混ぜる処理のハンドリング（プレイヤー、CPU、ネットワーク）"""
+        if self.is_player_shuffling:
+            self.shuffle_for_player(shuffler)
+        else:
+            if not self.is_input_available():
+                self.shuffle_for_cpu(shuffler)
+            else:
+                self.wait_for_network_player_shuffling()
+
+    @staticmethod
+    def is_input_available():
+        """標準入力が使えるかを判定"""
+        try:
+            # 入力可能かチェック
+            input("Press Enter to continue... (or wait for automatic shuffle)")
+            return True
+        except:
+            return False
+
+    def get_input(self, prompt):
+        """標準入力が可能かを確認し、入力を受け付ける"""
+        if self.is_input_available():
+            return input(prompt)  # 標準入力が有効な場合は普通に入力を受け付ける
+        else:
+            print("標準入力が無効な環境です。自動シャッフルが実行されます。")
+            return None  # 標準入力が無効なら None を返す
+
+
+if __name__ == "__main__":
+    # 実行用のコード
+    event_history = EventHistory()
+    game = WindTileShuffleGame(event_history, is_player_shuffling=True)
+
+    # プレイヤーによるシャッフル
+    shuffler = "Player1"
+    game.shuffle_for_player(shuffler)
+
+    # イベント履歴の確認
+    events = event_history.get_event_by_name("ShuffleCompletedEvent")
+    print("\nイベント履歴:")
+    for event in events:
+        print(f"シャッフルを担当したプレイヤー: {event.shuffler}")
+        print(f"シャッフルされた牌: {event.shuffled_tiles[0][0]} {event.shuffled_tiles[0][1]}")
+        print(f"                    {event.shuffled_tiles[1][0]} {event.shuffled_tiles[1][1]}")
+        print("---")
+
+    # シャッフル後、無限ループを防ぐために適切に終了
+    print("プログラムを終了します。")
+
+
+# -----------------------------------------------
+# 風牌選択フェーズ
+#     ほぼモック状態
+# -----------------------------------------------
+
+class WindTileSelectionPhase(State):
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self.selection_done = False
+
+    def enter(self):
+        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_PHASE_START))
+        self.selection()
+
+    def exit(self):
+        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_PHASE_END))
+
+    def update(self):
+        pass
+
+    def reset(self):
+        self.selection_done = False
+
+    def is_completed(self):
+        return self.selection_done
+
+    def selection(self):
+        shuffled_event = self.event_history.get_event_by_type(WIND_TILE_SHUFFLED)
+        shuffler = shuffled_event[0].extra_data["shuffler"]
+        self.event_bus.publish(LogEvent(WIND_TILE_SELECTION_VALID, extra_data="風牌1"))
+        self.selection_done = True
+
+
+# -----------------------------------------------
+# フェーズ遷移の順序を定義する台本
+# -----------------------------------------------
+
+class PhaseTransitionOrder:
+    """フェーズ遷移の順序を列挙"""
+    phase_names = [
+        WindTileShufflePhase,
+        WindTileSelectionPhase
+    ]
+
+
+# -----------------------------------------------
+# シーン管理クラス（大きな遷移）
+# -----------------------------------------------
+
+class Scene(ABC):
+    """シーン管理クラス"""
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+
+    @abstractmethod
+    def on_enter(self): ...
+    @abstractmethod
+    def on_exit(self): ...
+    @abstractmethod
+    def update(self): ...
+    @abstractmethod
+    def reset(self): ...
+    @abstractmethod
+    def is_finished(self): ...
+
+
+# -----------------------------------------------
+# タイトルメニュー画面シーン
+# -----------------------------------------------
+
+class TitleScene(Scene):
+    def __init__(self, event_bus, event_history):
+        super().__init__(event_bus, event_history)
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self._is_finished = False
+
+    def on_enter(self):
+        self.event_bus.publish(LogEvent(TITLE_SCENE_START))
+
+    def on_exit(self):
+        self.event_bus.publish(LogEvent(TITLE_SCENE_END))
+ 
+    def update(self):
+        self.mark_as_finished()
+
+    def reset(self):
+        self._is_finished = False
+
+    def is_finished(self):
+        return self._is_finished
+
+    def mark_as_finished(self):
+        if not self._is_finished:
+            self._is_finished = True
+            
+    def display_menu(self):  # メインメニューの表示
+        pass
+
+
+# -----------------------------------------------
+# 試合シーン
+# -----------------------------------------------
+
+class MatchScene(Scene):
+    def __init__(self, event_bus, event_history):
+        super().__init__(event_bus, event_history)
+        self.state_machine = StateMachine(
+            [
+                WindTileShufflePhase(event_bus, event_history),
+                WindTileSelectionPhase(event_bus, event_history)
+            ],
+            event_bus
+        )
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self._is_finished = False
+
+    def on_enter(self):
+        self.event_bus.publish(LogEvent(MATCH_SCENE_START))
+        self.start_match()
+
+    def on_exit(self):
+        self.event_bus.publish(LogEvent(MATCH_SCENE_END))
+
+    def update(self):
+        self.state_machine.update()
+        if self.state_machine.is_finished:
+            self.mark_as_finished()
+
+    def reset(self):
+        self.state_machine.reset()
+        self._is_finished = False
+
+    def is_finished(self):
+        return self._is_finished
+
+    def mark_as_finished(self):
+        if not self._is_finished:
+            self._is_finished = True
+            
+    def start_match(self):
+        self.state_machine.start()
+
+
+# -----------------------------------------------
+# 試合結果シーン
+# -----------------------------------------------
+
+class ResultScene(Scene):
+    def __init__(self, event_bus, event_history):
+        super().__init__(event_bus, event_history)
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self._is_finished = False
+
+    def on_enter(self):
+        self.event_bus.publish(LogEvent(RESULT_SCENE_START))
+        self.show_result()
+
+    def on_exit(self):
+        self.event_bus.publish(LogEvent(RESULT_SCENE_END))
+
+    def update(self):
+        self.mark_as_finished()
+
+    def reset(self):
+        self._is_finished = False
+
+    def is_finished(self):
+        return self._is_finished
+
+    def mark_as_finished(self):
+        if not self._is_finished:
+            self._is_finished = True
+
+    def show_result(self):
+        pass
+
+
+# -----------------------------------------------
+# シーンの条件分岐などあり得る順番を保持する
+#     もしシーン遷移やフェイズ遷移をイベント駆動にしていくなら不要になるか
+# -----------------------------------------------
+
+class SceneFlow:
+    scene_names = [
+        TitleScene,
+        MatchScene,
+        ResultScene
+    ]
+
+
+# -----------------------------------------------
+# シーンを遷移させる
+# -----------------------------------------------
+
+class SceneTransitioner:
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.scene_order = SceneFlow.scene_names 
+        self.current_scene_index = 0
+        self.current_scene = (
+            self.scene_order[self.current_scene_index]
+            (event_bus, event_history)
+        )
+        self.all_scene_done = False
+        
+    def run(self):
+        """シーンの実行ループを開始"""
+        self.current_scene.on_enter()
+
+        MAX_LOOP = 10
+        loop_count = 0
+
+        while self.current_scene:
+            loop_count += 1
+            if loop_count >= MAX_LOOP:
+                self.event_bus.publish(LogEvent(FAIL_SAFE_MAX_LOOP_COUNT))
+                break        
+
+            self.current_scene.update()
+
+            if self.current_scene.is_finished():
+                self.transition_to_next_scene()
+
+            self.wait_seconds(0.01)
+
+    def transition_to_next_scene(self):
+        """次のシーンに遷移"""
+        self.current_scene.on_exit()
+        self.current_scene_index += 1
+
+        if self.current_scene_index >= len(self.scene_order):  # シーンの順番が終わったら終了
+            self.current_scene = None
+            self.all_scene_done = True
+        else:
+            self.current_scene = (
+                self.scene_order[self.current_scene_index]
+                (self.current_scene.event_bus,
+                self.current_scene.event_history)
+            )
+            self.current_scene.on_enter()
+
+    def wait_seconds(self, second):
+        time.sleep(second)
+
+    def request_scene_change(self, next_scene):
+        """ユーザー操作で強制的に Scene を切り替える"""
+        if self.current_scene:
+            self.current_scene.on_exit()
+        self.current_scene = next_scene
+        self.current_scene.reset()
+        self.current_scene.on_enter()
+
+    def go_to_match_scene(self, restart=False):
+        match_scene = MatchScene(self.event_bus, self.event_history)
+        if restart:
+            match_scene.reset()  # PhaseもStateMachineも初期化
+        self.request_scene_change(match_scene)
+
+
+# -----------------------------------------------
+# ゲームサービス　Facadeパターン的にサブシステムをまとめるぜよ
+# -----------------------------------------------
+
+class GameServices:
+    """サブシステムを纏めて渡す為のFacade（に責務を徹する事）"""
+    def __init__(self, input_provider, network_client, event_bus):
+        self.input_provider = input_provider
+        self.network_client = network_client
+        self.events_bus = event_bus
+        
+
+# -----------------------------------------------
+# ゲーム管理クラス
+# -----------------------------------------------
+
+class GameSession:
+    """ゲームの進行を管理するクラス"""
+    def __init__(self, event_bus, event_history):
+        self.event_bus = event_bus
+        self.event_history = event_history
+        self.scene_transitioner = None
+
+    def start_game(self):
+        """ゲームの開始処理"""
+        self.scene_transitioner = SceneTransitioner(self.event_bus, self.event_history)
+        self.event_bus.publish(LogEvent(GAME_START))
+        self.scene_transitioner.run()
+        self.end_game()
+
+    def end_game(self):
+        """ゲームの終了処理"""
+        self.event_bus.publish(LogEvent(GAME_END))
+        # if self.scene_transitioner:
+        #    self.scene_transitioner.request_scene_change(None)  # ゲーム終了時にシーン遷移を停止
+
+# -----------------------------------------------
+# ゲーム初期化クラス
+# -----------------------------------------------
+
+class GameLauncher:
+    def __init__(self):
+        self.renderer = CUIRenderer()
+        self.event_history = EventHistory()
+        self.event_bus = EventBus(self.event_history)
+        self.event_handlers = EventHandlerBootstrapper(renderer, event_bus)
+        self.game_session = GameSession(self.event_bus, self.event_history)
+
+    def launch(self):
+        self.game_session.start_game()
+
+# -----------------------------------------------
+# 実行
+# -----------------------------------------------
+if __name__ == "__main__":
+    game_launcher = GameLauncher()  # ゲームの初期化
+    game_launcher.launch()
+    
